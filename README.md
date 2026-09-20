@@ -63,12 +63,34 @@ or you can do:
 git clone https://github.com/thepetabyteproject/your.git
 cd your
 pip install -r requirements.txt
-python setup.py install
+python -m pip install .
 ``` 
 
 **Note**:
     To use the `psrdada` format, you would need to install [psrdada-python](https://github.com/TRASAL/psrdada-python). [`your_heimdall.py`](https://thepetabyteproject.github.io/your/bin/your_heimdall/) requires [Heimdall](https://sourceforge.net/projects/heimdall-astro/) and [psrdada-python](https://github.com/TRASAL/psrdada-python). 
-    To run the tests you would need to install `pytest`. 
+
+## Testing
+
+Create a Python 3.14 environment, install the test extra, and run the CPU suite:
+
+```bash
+uv venv --python 3.14
+uv pip install -e '.[test]'
+MPLBACKEND=Agg uv run --no-project python -m pytest
+```
+
+GPU tests are skipped automatically when CUDA is unavailable.
+
+## Native CPU dedispersion
+
+The optional Rust kernel is built in release mode when Rust 1.83 or newer is available:
+
+```bash
+python -c "from your import _rust; print(_rust.dedispersets)"
+```
+
+It accumulates supported channels in `float32`; `int32` and `float64` inputs can differ from the Python fallback due to FP32 input rounding.
+
 
 
 # Documentation

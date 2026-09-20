@@ -2,6 +2,7 @@ import glob
 import re
 
 from setuptools import find_packages, setup
+from setuptools_rust import Binding, RustExtension
 
 with open("requirements.txt") as f:
     required = f.read().splitlines()
@@ -21,7 +22,16 @@ setup(
     url="https://github.com/thepetabyteproject/your",
     author="Devansh Agarwal, Kshitij Aggarwal",
     scripts=glob.glob("bin/*"),
-    tests_require=["pytest", "pytest-cov"],
+    rust_extensions=[
+        RustExtension(
+            "your._rust",
+            path="rust/Cargo.toml",
+            binding=Binding.PyO3,
+            debug=False,
+            optional=True,
+        )
+    ],
+    extras_require={"test": ["pytest", "pytest-cov"]},
     install_requires=required,
     long_description=long_description,
     long_description_content_type="text/markdown",

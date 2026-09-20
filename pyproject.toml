@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=62.4", "setuptools-rust==1.13.0"]
+build-backend = "setuptools.build_meta"
+
 [tool.ruff]
 # Default line length, same as Black
 line-length = 88

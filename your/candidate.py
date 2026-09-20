@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import h5py
+import numpy as np
 from scipy.optimize import golden
 
 from your import Your
@@ -8,6 +9,20 @@ from your.utils.gpu import gpu_dedisperse, gpu_dmt
 from your.utils.misc import *
 from your.utils.misc import _decimate, _resize
 from your.utils.rfi import sk_sg_filter
+
+try:
+    from your._rust import dedispersets as _rust_dedispersets
+except ImportError:
+    _rust_dedispersets = None
+
+_RUST_DEDISPERSETS_DTYPES = {
+    np.dtype(np.uint8),
+    np.dtype(np.uint16),
+    np.dtype(np.int16),
+    np.dtype(np.int32),
+    np.dtype(np.float32),
+    np.dtype(np.float64),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +372,13 @@ class Candidate(Your):
                 / 1000
             )
             delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
+            if (
+                _rust_dedispersets is not None
+                and type(self.data) is np.ndarray
+                and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
+                and self.data.flags.aligned
+            ):
+                return _rust_dedispersets(self.data, delay_bins)
             ts = np.zeros(nt, dtype=np.float32)
             for ii in range(nf):
                 ts += np.concatenate(
