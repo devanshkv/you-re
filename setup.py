@@ -29,7 +29,6 @@ setup(
             binding=Binding.PyO3,
             debug=False,
             args=["--locked"],
-            optional=True,
         )
     ],
     extras_require={"test": ["pytest", "pytest-cov"]},

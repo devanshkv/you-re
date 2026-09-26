@@ -1,4 +1,4 @@
-"""Installed-package checks: python checks/native_parity.py [--fallback-only].
+"""Installed-package checks: python checks/native_parity.py [--missing-rust].
 
 Run from outside the source tree (or use python -I) to verify wheel contents.
 No fixtures, archived binaries, or optional test framework are required.
@@ -145,29 +145,9 @@ def direct_checks(native):
             raise AssertionError("unsupported dtype accepted")
 
 
-def public_checks(module, rfi, fallback_only):
+def public_checks(module, rfi):
     data = (np.arange(129 * 37) % 251).astype(np.uint8).reshape(129, 37)
     obj = candidate(module, data)
-    if fallback_only:
-        assert module._rust_dedisperse is None
-        assert module._rust_dedispersets is None
-        assert module._rust_dmtime is None
-        assert rfi._rust_rfi_stats is None
-        shifted, total, dmt = outputs(obj)
-        bins = np.round(
-            4148808.0
-            * obj.dm
-            * (1 / obj.chan_freqs[0] ** 2 - 1 / obj.chan_freqs**2)
-            / 1000
-            / 0.001
-        ).astype(np.int64)
-        expected_shifted, expected_total = reference(data, bins, 0, len(data))
-        same(shifted, expected_shifted)
-        same(total, expected_total)
-        for row, dm in zip(dmt, obj.dm + np.linspace(-obj.dm, obj.dm, 5)):
-            same(row, obj.dedispersets(dms=dm))
-        assert rfi.spectral_kurtosis(data, N=3).shape == (37,)
-        return
     names = ("_rust_dedisperse", "_rust_dedispersets", "_rust_dmtime")
     with ExitStack() as stack:
         calls = [
@@ -176,10 +156,8 @@ def public_checks(module, rfi, fallback_only):
         ]
         actual = outputs(obj)
         assert all(call.call_count > 0 for call in calls)
-    with ExitStack() as stack:
-        for name in names:
-            stack.enter_context(patch.object(module, name, None))
-        expected = outputs(candidate(module, data))
+    # int64 takes the NumPy route while retaining these small integer values.
+    expected = outputs(candidate(module, data.astype(np.int64)))
     for a, b in zip(actual, expected):
         same(a, b)
     for sample in (
@@ -192,8 +170,7 @@ def public_checks(module, rfi, fallback_only):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             actual = rfi.spectral_kurtosis(sample, N=3, d=1.75)
-            with patch.object(rfi, "_rust_rfi_stats", None):
-                expected = rfi.spectral_kurtosis(sample, N=3, d=1.75)
+            expected = rfi.spectral_kurtosis(sample.astype(np.uint16), N=3, d=1.75)
         same(actual, expected)
     with patch.object(rfi, "_rust_rfi_stats", wraps=rfi._rust_rfi_stats) as call:
         rfi.spectral_kurtosis(data, N=3)
@@ -214,35 +191,39 @@ def public_checks(module, rfi, fallback_only):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fallback-only", action="store_true")
+    parser.add_argument("--missing-rust", action="store_true")
     args = parser.parse_args()
-    if args.fallback_only:
+    if args.missing_rust:
 
         class NoRust(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path, target=None):
                 if fullname == "your._rust":
-                    raise ModuleNotFoundError("Rust disabled for fallback check")
+                    raise ModuleNotFoundError(
+                        "Rust deliberately unavailable", name=fullname
+                    )
                 return None
 
         sys.meta_path.insert(0, NoRust())
-    else:
-        from your import _rust
+        # Candidate import also imports RFI through package initialization.
+        try:
+            importlib.import_module("your.candidate")
+        except ModuleNotFoundError as error:
+            assert error.name == "your._rust", error
+        else:
+            raise AssertionError("Candidate imported without required Rust extension")
+        print("PASS: missing Rust fails imports")
+        return
 
-        for name in ("dedisperse", "dedispersets", "dmtime", "rfi_stats"):
-            assert callable(getattr(_rust, name))
-        direct_checks(_rust)
+    from your import _rust
+
+    for name in ("dedisperse", "dedispersets", "dmtime", "rfi_stats"):
+        assert callable(getattr(_rust, name))
+    direct_checks(_rust)
     import your.candidate as module
     from your.utils import rfi
 
-    public_checks(module, rfi, args.fallback_only)
-    print(
-        "PASS: "
-        + (
-            "extension-absent fallback"
-            if args.fallback_only
-            else "native kernels and fallback parity"
-        )
-    )
+    public_checks(module, rfi)
+    print("PASS: native kernels and NumPy compatibility paths")
 
 
 if __name__ == "__main__":

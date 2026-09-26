@@ -47,11 +47,11 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: "1.88.0"
         run: |
-          pip install .
-      - name: Require native extension and compare fallback
+          pip install -e .
+      - name: Require native extension and check parity
         run: python -I checks/native_parity.py
-      - name: Verify extension-absent fallback
-        run: python -I checks/native_parity.py --fallback-only
+      - name: Reject missing native extension
+        run: python -I checks/native_parity.py --missing-rust
       - name: Ruff Format Check
         run: ruff format . --check
       - name: Run pytest and Generate coverage report

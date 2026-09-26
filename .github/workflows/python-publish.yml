@@ -22,7 +22,7 @@ jobs:
           python -m build --sdist
           python -m pip install dist/*.tar.gz
           python -I checks/native_parity.py
-          python -I checks/native_parity.py --fallback-only
+          python -I checks/native_parity.py --missing-rust
       - uses: actions/upload-artifact@v7
         with:
           name: distribution-sdist

@@ -36,7 +36,7 @@ exclude = [
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux_* *-win32"
 archs = ["native"]
-test-command = "python -I {project}/checks/native_parity.py && python -I {project}/checks/native_parity.py --fallback-only"
+test-command = "python -I {project}/checks/native_parity.py && python -I {project}/checks/native_parity.py --missing-rust"
 
 [tool.cibuildwheel.linux]
 before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0"

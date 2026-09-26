@@ -7,25 +7,13 @@ import numpy as np
 from scipy.optimize import golden
 
 from your import Your
+from your._rust import dedisperse as _rust_dedisperse
+from your._rust import dedispersets as _rust_dedispersets
+from your._rust import dmtime as _rust_dmtime
 from your.utils.gpu import gpu_dedisperse, gpu_dmt
 from your.utils.misc import *
 from your.utils.misc import _decimate, _resize
 from your.utils.rfi import sk_sg_filter
-
-try:
-    from your._rust import dedispersets as _rust_dedispersets
-except ImportError:
-    _rust_dedispersets = None
-
-try:
-    from your._rust import dmtime as _rust_dmtime
-except ImportError:
-    _rust_dmtime = None
-
-try:
-    from your._rust import dedisperse as _rust_dedisperse
-except ImportError:
-    _rust_dedisperse = None
 
 _RUST_DEDISPERSETS_DTYPES = {
     np.dtype(np.uint8),
@@ -407,8 +395,7 @@ class Candidate(Your):
                 delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
                 start, stop = _time_bounds(nt, time_range)
                 if (
-                    _rust_dedisperse is not None
-                    and type(self.data) is np.ndarray
+                    type(self.data) is np.ndarray
                     and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
                     # Retain NumPy's float64-to-float32 warning/error policy.
                     and self.data.dtype != np.float64
@@ -462,8 +449,7 @@ class Candidate(Your):
             delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
             start, stop = _time_bounds(nt, time_range)
             if (
-                _rust_dedispersets is not None
-                and type(self.data) is np.ndarray
+                type(self.data) is np.ndarray
                 and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
                 and self.data.flags.aligned
             ):
@@ -495,9 +481,7 @@ class Candidate(Your):
             dm_list = self.dm + np.linspace(-range_dm, range_dm, dmsteps)
             start, stop = _time_bounds(self.data.shape[0], time_range)
             if (
-                _rust_dmtime is not None
-                and _rust_dedispersets is not None
-                and type(self) is Candidate
+                type(self) is Candidate
                 and type(self.data) is np.ndarray
                 and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
                 and self.data.flags.aligned
@@ -511,7 +495,8 @@ class Candidate(Your):
                         and 16 * self.data.shape[0] <= len(dm_list) * (stop - start)
                     )
                 )
-                and getattr(self.dedispersets, "__func__", None) is Candidate.dedispersets
+                and getattr(self.dedispersets, "__func__", None)
+                is Candidate.dedispersets
                 and len(dm_list)
             ):
                 freqs = self.chan_freqs

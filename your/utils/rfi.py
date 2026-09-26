@@ -4,10 +4,7 @@ import numpy as np
 from scipy import stats
 from scipy.signal import savgol_filter as sg
 
-try:
-    from your._rust import rfi_stats as _rust_rfi_stats
-except ImportError:
-    _rust_rfi_stats = None
+from your._rust import rfi_stats as _rust_rfi_stats
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +64,7 @@ def spectral_kurtosis(data, N=1, d=None):
     """
     M = data.shape[0]
     if (
-        _rust_rfi_stats is not None
-        and type(data) is np.ndarray
+        type(data) is np.ndarray
         and data.dtype == np.uint8
         and data.ndim == 2
         and data.flags.c_contiguous
