@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 
 import numpy as np
 from psrdada import Writer
@@ -37,12 +38,29 @@ class DadaManager:
         logger.debug(
             f"Destroying previous buffers using: dada_db -d -k {self.key} 2>/dev/null"
         )
-        os.system(f"dada_db -d -k {self.key} 2>/dev/null")
+        subprocess.run(
+            ["dada_db", "-d", "-k", str(self.key)],
+            check=False,  # A previous buffer need not exist.
+            stderr=subprocess.DEVNULL,
+        )
         logger.info(
             f"Creating new buffers using dada_db -b {self.size} -k {self.key} -r {self.n_readers}"
         )
-        os.system(
-            f"dada_db -b {self.size} -k {self.key} -r {self.n_readers} -n 8 -l -p"
+        subprocess.run(
+            [
+                "dada_db",
+                "-b",
+                str(self.size),
+                "-k",
+                str(self.key),
+                "-r",
+                str(self.n_readers),
+                "-n",
+                "8",
+                "-l",
+                "-p",
+            ],
+            check=True,
         )
         self.writer = Writer()
         self.writer.connect(int(self.key, 16))
@@ -87,7 +105,7 @@ class DadaManager:
 
         """
         self.writer.disconnect()
-        os.system(f"dada_db -d -k {self.key} 2> /dev/null")
+        subprocess.run(["dada_db", "-d", "-k", str(self.key)], check=True)
 
     def __enter__(self):
         return self.setup()

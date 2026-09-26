@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import subprocess
 
 
 def generate_dm_list(
@@ -129,34 +130,52 @@ class HeimdallManager:
         Make the heimdall command and run it.
 
         """
-        cmd = "heimdall "
-        for attribute, value in self.__dict__.items():
-            if value is not None:
-                if isinstance(value, list):
-                    if attribute == "zap_chans":
-                        for chans in value:
-                            cmd += " -zap_chans "
-                            cmd += str(int(chans)) + " "
-                            cmd += str(int(chans))
-                    else:
-                        cmd += str(f" -{attribute} ")
-                        cmd += " ".join(map(str, value))
-                elif attribute == "verbosity":
-                    if value in ["V", "v", "g", "G"]:
-                        cmd += str(f" -{value} ")
-                    else:
-                        logging.warning("Allowed verbosity is v,V,g,G")
-                        logging.warning("Using v for now!")
-                        cmd += " -v "
-                elif (
-                    attribute == "no_scrunching"
-                    or attribute == "rfi_no_narrow"
-                    or attribute == "rfi_no_broad"
-                ):
-                    if value:
-                        cmd += str(f" -{attribute}")
-                else:
-                    cmd += str(f" -{attribute} {value}")
+        cmd = ["heimdall"]
+        for attribute in (
+            "k",
+            "f",
+            "verbosity",
+            "nsamps_gulp",
+            "beam",
+            "baseline_length",
+            "output_dir",
+            "dm",
+            "dm_tol",
+            "zap_chans",
+            "max_gaint_rate",
+            "dm_nbits",
+            "gpu_id",
+            "no_scrunching",
+            "rfi_tol",
+            "rfi_no_narrow",
+            "rfi_no_broad",
+            "boxcar_max",
+            "fswap",
+            "min_tscrunch_width",
+        ):
+            value = getattr(self, attribute)
+            if value is None:
+                continue
+            flag = "max_giant_rate" if attribute == "max_gaint_rate" else attribute
+            if attribute == "verbosity":
+                if value not in ("V", "v", "g", "G"):
+                    logging.warning("Allowed verbosity is v,V,g,G; using v")
+                    value = "v"
+                cmd.append(f"-{value}")
+            elif attribute in (
+                "no_scrunching",
+                "rfi_no_narrow",
+                "rfi_no_broad",
+                "fswap",
+            ):
+                if value:
+                    cmd.append(f"-{flag}")
+            elif attribute == "zap_chans" and isinstance(value, list):
+                for channel in value:
+                    cmd.extend(["-zap_chans", str(int(channel)), str(int(channel))])
+            else:
+                cmd.append(f"-{flag}")
+                cmd.extend(map(str, value) if isinstance(value, list) else [str(value)])
 
-        logging.info(f"Using cmd: \n{cmd}")
-        os.system(cmd)
+        logging.info("Using command arguments: %s", cmd)
+        subprocess.run(cmd, check=True)
