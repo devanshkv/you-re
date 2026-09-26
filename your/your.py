@@ -25,6 +25,14 @@ class Your(PsrfitsFile, SigprocFile):
         your_object = your.Your("/path/to/filterbank.fil")
         your_object = your.Your(["puppi_58763_B1919+21_0292_0001.fits","puppi_58763_B1919+21_0292_0002.fits"]
 
+    Use as a context manager to close input files deterministically::
+
+        with your.Your("observation.fil") as reader:
+            data = reader.get_data(0, 1024)
+
+    Alternatively, call ``close()`` explicitly. Returned data remains usable
+    after closing. Readers cannot be reopened.
+
     Attributes:
         your_header: instance of the Header class
 
@@ -69,13 +77,45 @@ class Your(PsrfitsFile, SigprocFile):
 
         logger.debug(f"Reading the file(s): {self.your_file}")
         self.formatclass = FORMATS[self.format]
-        self.formatclass.__init__(self, self.your_file)
-        if not self.source_name:
-            logger.info(
-                "Source name not present in the file. Setting source name to TEMP"
-            )
-            self.source_name = "TEMP"
-        self.your_header = Header(self)
+        self._closed = False
+        try:
+            self.formatclass.__init__(self, self.your_file)
+            if not self.source_name:
+                logger.info(
+                    "Source name not present in the file. Setting source name to TEMP"
+                )
+                self.source_name = "TEMP"
+            self.your_header = Header(self)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        """Release input files and mappings. Repeated calls are harmless."""
+        if self._closed:
+            return
+        if self.format == "fil":
+            try:
+                mapping = getattr(self, "_mmdata", None)
+                if mapping is not None:
+                    mapping.close()
+            finally:
+                fp = getattr(self, "fp", None)
+                if fp is not None:
+                    fp.close()
+        else:
+            fits = getattr(self, "fits", None)
+            if fits is not None:
+                fits.close()
+        self._closed = True
+
+    def __enter__(self):
+        if self._closed:
+            raise ValueError("I/O operation on closed reader")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     @property
     def chan_freqs(self):
@@ -185,6 +225,9 @@ class Your(PsrfitsFile, SigprocFile):
 
 
         """
+        if self._closed:
+            raise ValueError("I/O operation on closed reader")
+
         logger.debug(f"Reading {nsamp} samples from sample {nstart}")
 
         if self.your_header.time_decimation_factor != 1:

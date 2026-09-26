@@ -99,20 +99,24 @@ class Candidate(Your):
         flag_rfi=False,
     ):
         Your.__init__(self, fp)
-        self._reset_candidate(
-            dm=dm,
-            tcand=tcand,
-            width=width,
-            label=label,
-            snr=snr,
-            min_samp=min_samp,
-            device=device,
-            kill_mask=kill_mask,
-            spectral_kurtosis_sigma=spectral_kurtosis_sigma,
-            savgol_frequency_window=savgol_frequency_window,
-            savgol_sigma=savgol_sigma,
-            flag_rfi=flag_rfi,
-        )
+        try:
+            self._reset_candidate(
+                dm=dm,
+                tcand=tcand,
+                width=width,
+                label=label,
+                snr=snr,
+                min_samp=min_samp,
+                device=device,
+                kill_mask=kill_mask,
+                spectral_kurtosis_sigma=spectral_kurtosis_sigma,
+                savgol_frequency_window=savgol_frequency_window,
+                savgol_sigma=savgol_sigma,
+                flag_rfi=flag_rfi,
+            )
+        except BaseException:
+            self.close()
+            raise
 
     def _reset_candidate(
         self,

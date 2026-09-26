@@ -125,7 +125,7 @@ class PsrfitsFile(object):
         self.poln_order = self.specinfo.poln_order
         self.nsamp_per_subint = self.specinfo.spectra_per_subint
         self.nsubints = self.specinfo.num_subint[0]
-        self.freqs = self.fits["SUBINT"].data[0]["DAT_FREQ"]
+        self.freqs = self.fits["SUBINT"].data[0]["DAT_FREQ"].copy()
         self.frequencies = self.freqs  # Alias
         self.nspec = self.specinfo.N
 
