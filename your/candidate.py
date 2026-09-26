@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from operator import index
+
 import h5py
 import numpy as np
 from scipy.optimize import golden
@@ -15,6 +17,16 @@ try:
 except ImportError:
     _rust_dedispersets = None
 
+try:
+    from your._rust import dmtime as _rust_dmtime
+except ImportError:
+    _rust_dmtime = None
+
+try:
+    from your._rust import dedisperse as _rust_dedisperse
+except ImportError:
+    _rust_dedisperse = None
+
 _RUST_DEDISPERSETS_DTYPES = {
     np.dtype(np.uint8),
     np.dtype(np.uint16),
@@ -25,6 +37,29 @@ _RUST_DEDISPERSETS_DTYPES = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _time_bounds(nt, time_range):
+    if time_range is None:
+        return 0, nt
+    start, stop = map(index, time_range)
+    if not 0 <= start <= stop <= nt:
+        raise ValueError("expected 0 <= start <= stop <= data length")
+    return start, stop
+
+
+def _dedispersed_channel(column, delay, start, stop):
+    """Slice the existing circular-shift convention without a full-channel copy."""
+    nt = len(column)
+    if start == stop:
+        return column[:0]
+    # Delays outside the input length are identity shifts in the original slices.
+    pivot = -int(delay) if -nt < delay < nt else 0
+    source = (start + pivot) % nt
+    count = min(stop - start, nt - source)
+    return np.concatenate(
+        (column[source : source + count], column[: stop - start - count])
+    )
 
 
 class Candidate(Your):
@@ -64,6 +99,40 @@ class Candidate(Your):
         flag_rfi=False,
     ):
         Your.__init__(self, fp)
+        self._reset_candidate(
+            dm=dm,
+            tcand=tcand,
+            width=width,
+            label=label,
+            snr=snr,
+            min_samp=min_samp,
+            device=device,
+            kill_mask=kill_mask,
+            spectral_kurtosis_sigma=spectral_kurtosis_sigma,
+            savgol_frequency_window=savgol_frequency_window,
+            savgol_sigma=savgol_sigma,
+            flag_rfi=flag_rfi,
+        )
+
+    def _reset_candidate(
+        self,
+        *,
+        dm=None,
+        tcand=0,
+        width=0,
+        label=-1,
+        snr=0,
+        min_samp=256,
+        device=0,
+        kill_mask=np.array([False]),
+        spectral_kurtosis_sigma=4,
+        savgol_frequency_window=15,
+        savgol_sigma=4,
+        flag_rfi=False,
+    ):
+        """Reset candidate-specific state while retaining its input reader."""
+        self.your_header.time_decimation_factor = 1
+        self.your_header.frequency_decimation_factor = 1
         self.dm = dm
         self.tcand = tcand
         self.width = width
@@ -90,6 +159,7 @@ class Candidate(Your):
             f"width:{self.width}, "
             f"tcand: {self.tcand}"
         )
+        return self
 
     def save_h5(self, out_dir=None, fnout=None):
         """
@@ -285,27 +355,24 @@ class Candidate(Your):
         if self.kill_mask.any():
             logger.info("Applying the kill mask")
             assert len(self.kill_mask) == self.data.shape[1]
-            data_copy = self.data.copy()
-            data_copy[:, self.kill_mask] = 0
-            self.data = data_copy
-            del data_copy
+            if self.kill_mask.dtype == np.bool_ and self.kill_mask.ndim == 1:
+                np.copyto(self.data, 0, where=self.kill_mask[None, :])
+            else:
+                self.data[:, self.kill_mask] = 0
 
         if self.flag_rfi:
-            data_copy = self.data.copy()
             mask = sk_sg_filter(
-                data=data_copy,
+                data=self.data,
                 your_object=self,
                 spectral_kurtosis_sigma=self.spectral_kurtosis_sigma,
                 savgol_frequency_window=self.savgol_frequency_window,
                 savgol_sigma=self.savgol_sigma,
             )
             self.rfi_mask = mask
-            data_copy[:, self.rfi_mask] = 0
-            self.data = data_copy
-            del data_copy
+            np.copyto(self.data, 0, where=self.rfi_mask[None, :])
         return self
 
-    def dedisperse(self, dms=None, target="CPU"):
+    def dedisperse(self, dms=None, target="CPU", *, time_range=None):
         """
         Dedisperse a chunk of data. Saves the dedispersed chunk in `self.dedispersed`.
 
@@ -313,11 +380,14 @@ class Candidate(Your):
             Our method rolls the data around while dedispersing it.
 
         Args:
+            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
             dms (float): The DM to dedisperse the data at.
             target (str): 'CPU' to run the code on the CPU or 'GPU' to run it on a GPU.
 
         """
 
+        if time_range is not None and target != "CPU":
+            raise ValueError("time_range is supported only on CPU")
         if dms is None:
             dms = self.dm
         if self.data is not None:
@@ -331,14 +401,27 @@ class Candidate(Your):
                     / 1000
                 )
                 delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
-                self.dedispersed = np.zeros(self.data.shape, dtype=np.float32)
-                for ii in range(nf):
-                    self.dedispersed[:, ii] = np.concatenate(
-                        [
-                            self.data[-delay_bins[ii] :, ii],
-                            self.data[: -delay_bins[ii], ii],
-                        ]
+                start, stop = _time_bounds(nt, time_range)
+                if (
+                    _rust_dedisperse is not None
+                    and type(self.data) is np.ndarray
+                    and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
+                    # Retain NumPy's float64-to-float32 warning/error policy.
+                    and self.data.dtype != np.float64
+                    and self.data.flags.aligned
+                    and self.data.flags.c_contiguous
+                    # Long, narrow outputs can be faster with NumPy column copies.
+                    and (stop - start <= 1024 or nf >= 512)
+                ):
+                    self.dedispersed = _rust_dedisperse(
+                        self.data, delay_bins, start, stop
                     )
+                else:
+                    self.dedispersed = np.empty((stop - start, nf), dtype=np.float32)
+                    for ii in range(nf):
+                        self.dedispersed[:, ii] = _dedispersed_channel(
+                            self.data[:, ii], delay_bins[ii], start, stop
+                        )
             elif target == "GPU":
                 gpu_dedisperse(self, device=self.device)
         else:
@@ -346,7 +429,7 @@ class Candidate(Your):
             self.dedispersed = None
         return self
 
-    def dedispersets(self, dms=None):
+    def dedispersets(self, dms=None, *, time_range=None):
         """
         Create a dedispersed time series
 
@@ -354,6 +437,7 @@ class Candidate(Your):
             Our method rolls the data around while dedispersing it.
 
         Args:
+            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
             dms (float): The DM to dedisperse the data at.
 
         Returns:
@@ -372,21 +456,22 @@ class Candidate(Your):
                 / 1000
             )
             delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
+            start, stop = _time_bounds(nt, time_range)
             if (
                 _rust_dedispersets is not None
                 and type(self.data) is np.ndarray
                 and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
                 and self.data.flags.aligned
             ):
-                return _rust_dedispersets(self.data, delay_bins)
-            ts = np.zeros(nt, dtype=np.float32)
+                return _rust_dedispersets(self.data, delay_bins, start, stop)
+            ts = np.zeros(stop - start, dtype=np.float32)
             for ii in range(nf):
-                ts += np.concatenate(
-                    [self.data[-delay_bins[ii] :, ii], self.data[: -delay_bins[ii], ii]]
+                ts += _dedispersed_channel(
+                    self.data[:, ii], delay_bins[ii], start, stop
                 )
             return ts
 
-    def dmtime(self, dmsteps=256, target="CPU"):
+    def dmtime(self, dmsteps=256, target="CPU", *, time_range=None):
         """
         Generates DM-time array of the candidate by dedispersing at adjacent DM values. Saves the data in `self.dmt`.
 
@@ -394,16 +479,47 @@ class Candidate(Your):
             Our method rolls the data around while dedispersing it.
 
         Args:
+            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
             dmsteps (int): Number of DMs to dedisperse at.
             target (str): 'CPU' to run the code on the CPU or 'GPU' to run it on a GPU.
 
         """
+        if time_range is not None and target != "CPU":
+            raise ValueError("time_range is supported only on CPU")
         if target == "CPU":
             range_dm = self.dm
             dm_list = self.dm + np.linspace(-range_dm, range_dm, dmsteps)
-            self.dmt = np.zeros((dmsteps, self.data.shape[0]), dtype=np.float32)
-            for ii, dm in enumerate(dm_list):
-                self.dmt[ii, :] = self.dedispersets(dms=dm)
+            start, stop = _time_bounds(self.data.shape[0], time_range)
+            if (
+                _rust_dmtime is not None
+                and _rust_dedispersets is not None
+                and type(self) is Candidate
+                and type(self.data) is np.ndarray
+                and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
+                and self.data.flags.aligned
+                and (
+                    stop - start <= 1024
+                    # Keep small or sparse wide batches on the scalar path;
+                    # packing's full-input pass needs enough repeated DM work.
+                    or (
+                        self.data.flags.c_contiguous
+                        and len(dm_list) >= 32
+                        and 16 * self.data.shape[0] <= len(dm_list) * (stop - start)
+                    )
+                )
+                and getattr(self.dedispersets, "__func__", None) is Candidate.dedispersets
+                and len(dm_list)
+            ):
+                freqs = self.chan_freqs
+                assert self.data.shape[1] == len(freqs)
+                frequency_term = 1 / freqs[0] ** 2 - 1 / freqs**2
+                self.dmt = _rust_dmtime(
+                    self.data, dm_list, frequency_term, self.native_tsamp, start, stop
+                )
+            else:
+                self.dmt = np.empty((dmsteps, stop - start), dtype=np.float32)
+                for ii, dm in enumerate(dm_list):
+                    self.dmt[ii, :] = self.dedispersets(dms=dm, time_range=time_range)
         elif target == "GPU":
             gpu_dmt(self, device=self.device)
         return self

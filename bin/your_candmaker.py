@@ -18,6 +18,7 @@ os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 import textwrap
 from datetime import datetime
 from multiprocessing import Pool
+from multiprocessing.util import Finalize
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,10 @@ from your.utils.misc import YourArgparseFormatter
 
 logger = logging.getLogger()
 
+_worker_candidate = None
+_worker_candidate_key = None
+_worker_candidate_finalizer = None
+
 
 def cpu_dedisp_dmt(cand, args):
     pulse_width = cand.width
@@ -37,7 +42,26 @@ def cpu_dedisp_dmt(cand, args):
         time_decimate_factor = pulse_width // 2
     logger.debug(f"Time decimation factor {time_decimate_factor}")
 
-    cand.dmtime()
+    # Plan the same crop on the padded, decimated time axis. Only bypass full
+    # arrays when every requested bin lies inside the unpadded shifted data.
+    nt = cand.data.shape[0]
+    time_range = None
+    if time_decimate_factor > 0 and args.time_size > 0:
+        decimated_nt = (nt + time_decimate_factor - 1) // time_decimate_factor
+        crop_start = decimated_nt // 2 - args.time_size // 2
+        crop_stop = crop_start + args.time_size
+        if (
+            crop_start >= 0
+            and (crop_stop < decimated_nt or args.time_size == decimated_nt)
+            and crop_stop * time_decimate_factor <= nt
+        ):
+            time_range = (
+                crop_start * time_decimate_factor,
+                crop_stop * time_decimate_factor,
+            )
+    # ponytail: crops needing median padding retain the full-array path;
+    # add bounded median handling only if those cases dominate real workloads.
+    cand.dmtime(time_range=time_range)
     logger.info("Made DMT")
     if args.opt_dm:
         logger.info("Optimising DM")
@@ -46,29 +70,90 @@ def cpu_dedisp_dmt(cand, args):
     else:
         cand.dm_opt = -1
         cand.snr_opt = -1
-    cand.dedisperse()
+    cand.dedisperse(time_range=time_range)
     logger.info("Made Dedispersed profile")
 
     # Frequency - Time reshaping
-    cand.decimate(
-        key="ft", axis=0, pad=True, decimate_factor=time_decimate_factor, mode="median"
-    )
-    crop_start_sample_ft = cand.dedispersed.shape[0] // 2 - args.time_size // 2
-    cand.dedispersed = crop(cand.dedispersed, crop_start_sample_ft, args.time_size, 0)
+    if time_decimate_factor != 1:
+        cand.decimate(
+            key="ft",
+            axis=0,
+            pad=True,
+            decimate_factor=time_decimate_factor,
+            mode="median",
+        )
+    if time_range is None:
+        crop_start_sample_ft = cand.dedispersed.shape[0] // 2 - args.time_size // 2
+        cand.dedispersed = crop(
+            cand.dedispersed, crop_start_sample_ft, args.time_size, 0
+        )
     logger.info(f"Decimated Time axis of FT to tsize: {cand.dedispersed.shape[0]}")
     # DM-time reshaping
-    cand.decimate(
-        key="dmt", axis=1, pad=True, decimate_factor=time_decimate_factor, mode="median"
-    )
-    crop_start_sample_dmt = cand.dmt.shape[1] // 2 - args.time_size // 2
-    cand.dmt = crop(cand.dmt, crop_start_sample_dmt, args.time_size, 1)
+    if time_decimate_factor != 1:
+        cand.decimate(
+            key="dmt",
+            axis=1,
+            pad=True,
+            decimate_factor=time_decimate_factor,
+            mode="median",
+        )
+    if time_range is None:
+        crop_start_sample_dmt = cand.dmt.shape[1] // 2 - args.time_size // 2
+        cand.dmt = crop(cand.dmt, crop_start_sample_dmt, args.time_size, 1)
     logger.info(
         f"Decimated DM-Time to dmsize: {cand.dmt.shape[0]} and tsize: {cand.dmt.shape[1]}"
     )
     return cand
 
 
+def _input_files(filename, num_files):
+    fname, ext = os.path.splitext(filename)
+    if ext == ".fits" or ext == ".sf":
+        if num_files == 1:
+            return [filename]
+        files = glob.glob(fname[:-5] + "*fits")
+        if len(files) != num_files:
+            raise ValueError(
+                "Number of fits files found was not equal to num_files in cand csv."
+            )
+        return sorted(files)
+    if ext == ".fil":
+        return [filename]
+    raise TypeError("Can only work with list of fits file or filterbanks")
+
+
+def _reader_key(files):
+    return tuple(
+        (path, stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        for path in files
+        for stat in [os.stat(path)]
+    )
+
+
+def _clear_worker_candidate():
+    global _worker_candidate, _worker_candidate_key
+    if _worker_candidate is not None:
+        try:
+            _worker_candidate.fits.close()
+        except Exception:
+            logger.debug("Could not close cached FITS reader", exc_info=True)
+    _worker_candidate = None
+    _worker_candidate_key = None
+
+
+def _init_cand_worker():
+    global _worker_candidate_finalizer
+    _clear_worker_candidate()
+    _worker_candidate_finalizer = Finalize(
+        None, _clear_worker_candidate, exitpriority=10
+    )
+
+
 def cand2h5(cand_val):
+    return _cand2h5(cand_val)
+
+
+def _cand2h5(cand_val, *, candidate=None, files=None):
     """
     TODO: Add option to use cand.resize for reshaping FT and DMT
     Generates h5 file of candidate with resized frequency-time and DM-time arrays
@@ -94,24 +179,11 @@ def cand2h5(cand_val):
     else:
         logger.debug("No Kill Mask")
 
-    fname, ext = os.path.splitext(filename)
-    if ext == ".fits" or ext == ".sf":
-        if num_files == 1:
-            files = [filename]
-        else:
-            files = glob.glob(fname[:-5] + "*fits")
-            if len(files) != num_files:
-                raise ValueError(
-                    "Number of fits files found was not equal to num_files in cand csv."
-                )
-    elif ext == ".fil":
-        files = [filename]
-    else:
-        raise TypeError("Can only work with list of fits file or filterbanks")
+    if files is None:
+        files = _input_files(filename, num_files)
 
     logger.debug(f"Source file list: {files}")
-    cand = Candidate(
-        files,
+    candidate_kwargs = dict(
         snr=snr,
         width=width,
         dm=dm,
@@ -123,6 +195,10 @@ def cand2h5(cand_val):
         savgol_sigma=args.savgol_sigma,
         flag_rfi=args.flag_rfi,
     )
+    if candidate is None:
+        cand = Candidate(files, **candidate_kwargs)
+    else:
+        cand = candidate._reset_candidate(**candidate_kwargs)
     if os.path.exists(str(kill_mask_path)):
         kill_mask = np.zeros(cand.nchans, dtype=np.bool_)
         kill_mask[kill_chans] = True
@@ -158,8 +234,31 @@ def cand2h5(cand_val):
     if os.path.getsize(fout) < 100 * 1024:
         raise ValueError(f"File with id: {cand.id} has issues! Its size is too less.")
     logger.info(fout)
-    del cand
+    if candidate is None:
+        del cand
+    else:
+        cand.data = cand.dedispersed = cand.dmt = None
     return None
+
+
+def cached_cand2h5(cand_val):
+    """Reuse one FITS Candidate within each serial Pool worker."""
+    global _worker_candidate, _worker_candidate_key
+    try:
+        files = _input_files(cand_val[0], cand_val[7])
+        if os.path.splitext(cand_val[0])[1] not in (".fits", ".sf"):
+            _clear_worker_candidate()
+            return _cand2h5(cand_val, files=files)
+
+        key = _reader_key(files)
+        if key != _worker_candidate_key:
+            _clear_worker_candidate()
+            _worker_candidate = Candidate(files, dm=cand_val[3])
+            _worker_candidate_key = key
+        return _cand2h5(cand_val, candidate=_worker_candidate, files=files)
+    except BaseException:
+        _clear_worker_candidate()
+        raise
 
 
 if __name__ == "__main__":
@@ -345,5 +444,5 @@ if __name__ == "__main__":
             ]
         )
 
-    with Pool(processes=values.nproc) as pool:
-        pool.map(cand2h5, process_list, chunksize=1)
+    with Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
+        pool.map(cached_cand2h5, process_list, chunksize=1)
