@@ -31,3 +31,13 @@ exclude = [
 # No extra config needed for black compatibility.
 # To opt-in to experimental features:
 # preview = true
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-win32"
+archs = ["native"]
+test-command = "python -I {project}/checks/native_parity.py && python -I {project}/checks/native_parity.py --fallback-only"
+
+[tool.cibuildwheel.linux]
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0"
+environment = { PATH = "/tmp/your-cargo/bin:$PATH", CARGO_HOME = "/tmp/your-cargo", RUSTUP_HOME = "/tmp/your-rustup", RUSTUP_TOOLCHAIN = "1.88.0" }

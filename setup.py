@@ -28,6 +28,7 @@ setup(
             path="rust/Cargo.toml",
             binding=Binding.PyO3,
             debug=False,
+            args=["--locked"],
             optional=True,
         )
     ],
@@ -47,6 +48,7 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
         "Topic :: Scientific/Engineering :: Astronomy",
     ],

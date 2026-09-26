@@ -105,6 +105,20 @@ python -c "from your import _rust; print(_rust.dedispersets)"
 
 It accumulates supported channels in `float32`; `int32` and `float64` inputs can differ from the Python fallback due to FP32 input rounding.
 
+Check the installed native extension and the extension-absent fallback separately:
+
+```bash
+python -I checks/native_parity.py
+python -I checks/native_parity.py --fallback-only
+cargo test --manifest-path rust/Cargo.toml --locked
+```
+
+The native check fails if any kernel is missing. It covers array layouts, empty
+inputs, delay boundaries, float32 accumulation, and Python dispatch. Computation
+lives in `rust/src/kernels.rs`; Python validation and conversion stay in `lib.rs`.
+CI checks Rust 1.83 and 1.88 and builds tested CPython 3.10–3.14 wheels for Linux
+x86-64, macOS Intel/Apple Silicon, and Windows x86-64.
+
 
 
 # Documentation
