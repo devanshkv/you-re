@@ -278,7 +278,7 @@ class Writer:
         input file and write with the attributes setup in the writer class.
 
         """
-        self.outname = self.outdir + self.outname + ".fil"
+        outfile = os.path.join(self.outdir, self.outname + ".fil")
 
         if self.npoln == 4:
             logger.warning(
@@ -296,21 +296,22 @@ class Writer:
             task = progress.add_task("[green]Writing...", total=self.nsamp)
             # create the header
             sigproc_object = sigproc_object_from_writer(self)
+            sigproc_object.rawdatafile = outfile
 
             # write the header
-            sigproc_object.write_header(filename=self.outname)
+            sigproc_object.write_header(filename=outfile)
 
             # make sure header got written
-            if not os.path.isfile(self.outname):
+            if not os.path.isfile(outfile):
                 raise IOError("Failed to write the filterbank file")
 
-            if data == None:
+            if data is None:
                 # get the nstart and number of samples to write
                 start_sample = self.nstart
                 samples_left = self.nsamp
 
                 # open the file
-                with open(self.outname, "ab") as f:
+                with open(outfile, "ab") as f:
                     # read till there are spectra to read
                     while samples_left > 0:
                         self.get_data_to_write(start_sample, self.gulp)
@@ -326,10 +327,10 @@ class Writer:
                         samples_left -= self.gulp
             else:
                 if data.dtype == self.your_object.your_header.dtype:
-                    logger.debug(f"write data of shape {data.shape} to {self.outname}")
-                    with open(self.outname, "ab") as f:
+                    logger.debug(f"write data of shape {data.shape} to {outfile}")
+                    with open(outfile, "ab") as f:
                         f.write(data.ravel())
-                    progress.update(task, self.nsamp)
+                    progress.update(task, advance=self.nsamp)
                     logger.debug("Wrote given spectra")
                 else:
                     raise TypeError(
@@ -411,8 +412,9 @@ class Writer:
         """
         from your.formats.dada import DadaManager
 
-        if dada_key is None:
-            self.dada_key = hex(np.random.randint(0, 16**4))
+        self.dada_key = (
+            hex(np.random.randint(0, 16**4)) if dada_key is None else dada_key
+        )
 
         if data_step is not None:
             self.data_step = data_step
@@ -456,7 +458,7 @@ class Writer:
                 self.DM.dump_header(header)
                 self.DM.dump_data(self.data.flatten())
                 progress.update(task, advance=self.data_step)
-                if data_read == self.nsamp - self.data_step:
+                if data_read + self.data_step >= self.nstart + self.nsamp:
                     logger.info("Marked the end of data")
                     self.DM.eod()
                 else:
