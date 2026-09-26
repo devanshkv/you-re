@@ -307,16 +307,16 @@ class Your(PsrfitsFile, SigprocFile):
             if len(sh) == 2:
                 nt, nf = sh
                 data = data.reshape(
-                    self.your_header.time_decimation_factor,
                     nt // self.your_header.time_decimation_factor,
+                    self.your_header.time_decimation_factor,
                     nf // self.your_header.frequency_decimation_factor,
                     self.your_header.frequency_decimation_factor,
                 )
             elif len(sh) == 3:
                 nt, nifs, nf = sh
                 data = data.reshape(
-                    self.your_header.time_decimation_factor,
                     nt // self.your_header.time_decimation_factor,
+                    self.your_header.time_decimation_factor,
                     nifs,
                     nf // self.your_header.frequency_decimation_factor,
                     self.your_header.frequency_decimation_factor,
@@ -327,7 +327,7 @@ class Your(PsrfitsFile, SigprocFile):
                     f"dimensions."
                 )
             data = data.astype(np.float32)
-            data = data.mean(axis=0)
+            data = data.mean(axis=1)
             data = data.mean(axis=-1)
         if self.your_header.nbits != 32:
             if (

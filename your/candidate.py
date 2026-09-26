@@ -546,8 +546,8 @@ class Candidate(Your):
             x = time_series
         argmax = np.argmax(x)
         mask = np.ones(len(x), dtype=np.bool_)
-        mask[argmax - self.width // 2 : argmax + self.width // 2] = 0
-        x -= x[mask].mean()
+        mask[max(0, argmax - self.width // 2) : argmax + self.width // 2] = 0
+        x = x - x[mask].mean()
         std = np.std(x[mask])
         return x.max() / std
 
