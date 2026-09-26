@@ -81,6 +81,20 @@ MPLBACKEND=Agg uv run --no-project python -m pytest
 
 GPU tests are skipped automatically when CUDA is unavailable.
 
+## Candidate plots
+
+`your_h5plotter.py` saves JPEG images at quality 95 with no chroma subsampling
+(4:4:4) by default. Use `--format png` for lossless output. DPI remains 300.
+
+```bash
+your_h5plotter.py --files candidate.h5 --out_dir plots --format jpeg
+```
+
+The output directory must already exist. Python callers can select JPEG with
+`plot_h5("candidate.h5", output_format="jpeg")`; existing calls default to PNG.
+JPEG preserves plot dimensions and DPI but changes pixels and does not carry
+PNG's Software text metadata. The source HDF5 data is unaffected.
+
 ## Native CPU dedispersion
 
 The optional Rust kernel is built in release mode when Rust 1.83 or newer is available:
