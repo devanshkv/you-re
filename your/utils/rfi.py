@@ -4,6 +4,11 @@ import numpy as np
 from scipy import stats
 from scipy.signal import savgol_filter as sg
 
+try:
+    from your._rust import rfi_stats as _rust_rfi_stats
+except ImportError:
+    _rust_rfi_stats = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,13 +65,50 @@ def spectral_kurtosis(data, N=1, d=None):
          numpy.ndarray: Spectral Kurtosis along frequency axis
 
     """
-    zero_mask = data == 0
-    data = np.ma.array(data.astype(float), mask=zero_mask)
-    S1 = data.sum(0)
-    S2 = (data**2).sum(0)
     M = data.shape[0]
-    if d is None:
-        d = (np.nanmean(data.ravel()) / np.nanstd(data)) ** 2
+    if (
+        _rust_rfi_stats is not None
+        and type(data) is np.ndarray
+        and data.dtype == np.uint8
+        and data.ndim == 2
+        and data.flags.c_contiguous
+    ):
+        stats = _rust_rfi_stats(data)
+        if stats is not None:
+            S1, S2, total, count, variance = stats
+            channel_mask = S1 == 0
+            S1 = np.ma.array(S1, mask=channel_mask)[()]
+            S2 = np.ma.array(S2, mask=channel_mask)[()]
+            if d is None:
+                mean = total / count
+                d = (mean / np.sqrt(variance / count)) ** 2
+            return ((M * d * N) + 1) * ((M * S2 / (S1**2)) - 1) / (M - 1)
+
+    zero_mask = data == 0
+    if type(data) is np.ndarray and data.dtype.kind in "iu" and data.ndim in (1, 2):
+        count = data.size - np.count_nonzero(zero_mask)
+    else:
+        count = 0
+    if count:
+        # Integer inputs are finite; zeros contribute nothing to either sum.
+        work = data.astype(float)
+        channel_mask = zero_mask.all(axis=0)
+        S1 = np.ma.array(work.sum(0), mask=channel_mask)[()]
+        S2 = np.ma.array((work**2).sum(0), mask=channel_mask)[()]
+        if d is None:
+            # Preserve the original mean/std reduction order, including F-order data.
+            mean = work.ravel().sum() / count
+            variance_mean = work.sum() / count
+            work -= variance_mean
+            work[zero_mask] = 0
+            np.square(work, out=work)
+            d = (mean / np.sqrt(work.sum() / count)) ** 2
+    else:
+        data = np.ma.array(data.astype(float), mask=zero_mask)
+        S1 = data.sum(0)
+        S2 = (data**2).sum(0)
+        if d is None:
+            d = (np.nanmean(data.ravel()) / np.nanstd(data)) ** 2
     return ((M * d * N) + 1) * ((M * S2 / (S1**2)) - 1) / (M - 1)
 
 

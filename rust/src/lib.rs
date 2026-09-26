@@ -31,6 +31,107 @@ impl_to_f32!(u8, u16, i16, i32, f32, f64);
 
 const CHANNEL_TILE: usize = 32;
 
+// Match NumPy's contiguous float64 reduction without a squared-data array.
+const PAIRWISE_BLOCK: usize = 128;
+
+fn pairwise_squared_deviations(values: &[u8], mean: f64) -> f64 {
+    let squared = |value: u8| {
+        if value == 0 {
+            0.0
+        } else {
+            let deviation = f64::from(value) - mean;
+            deviation * deviation
+        }
+    };
+    match values.len() {
+        0..8 => values.iter().fold(-0.0, |sum, &value| sum + squared(value)),
+        8..=PAIRWISE_BLOCK => {
+            let mut sums = [
+                squared(values[0]), squared(values[1]), squared(values[2]), squared(values[3]),
+                squared(values[4]), squared(values[5]), squared(values[6]), squared(values[7]),
+            ];
+            let full = values.len() - values.len() % 8;
+            let mut index = 8;
+            while index < full {
+                for offset in 0..8 {
+                    sums[offset] += squared(values[index + offset]);
+                }
+                index += 8;
+            }
+            let mut sum = ((sums[0] + sums[1]) + (sums[2] + sums[3]))
+                + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
+            while index < values.len() {
+                sum += squared(values[index]);
+                index += 1;
+            }
+            sum
+        }
+        _ => {
+            let mut middle = values.len() / 2;
+            middle -= middle % 8;
+            pairwise_squared_deviations(&values[..middle], mean)
+                + pairwise_squared_deviations(&values[middle..], mean)
+        }
+    }
+}
+
+#[pyfunction]
+fn rfi_stats<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, u8>,
+) -> PyResult<Option<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, u64, u64, f64)>> {
+    if !data.is_c_contiguous() {
+        return Ok(None);
+    }
+    let values = match data.as_slice() {
+        Ok(values) => values,
+        Err(_) => return Ok(None),
+    };
+    // The channel sums are returned as float64, so retain exact integer sums.
+    if u64::try_from(values.len()).unwrap_or(u64::MAX) > (1_u64 << 53) / 65_025 {
+        return Ok(None);
+    }
+
+    let channels = data.shape()[1];
+    if channels == 0 {
+        return Ok(None);
+    }
+    let mut s1 = Vec::new();
+    let mut s2 = Vec::new();
+    s1.try_reserve_exact(channels)
+        .and_then(|_| s2.try_reserve_exact(channels))
+        .map_err(|_| PyMemoryError::new_err("RFI channel statistics are too large"))?;
+    s1.resize(channels, 0.0);
+    s2.resize(channels, 0.0);
+
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for frame in values.chunks_exact(channels) {
+        for (channel, &value) in frame.iter().enumerate() {
+            if value != 0 {
+                let value = u64::from(value);
+                total += value;
+                count += 1;
+                s1[channel] += value as f64;
+                s2[channel] += (value * value) as f64;
+            }
+        }
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let mean = total as f64 / count as f64;
+    let variance = pairwise_squared_deviations(values, mean);
+    Ok(Some((
+        PyArray1::from_vec(py, s1),
+        PyArray1::from_vec(py, s2),
+        total,
+        count,
+        variance,
+    )))
+}
+
 fn add_channel<T: Element + Copy + ToF32>(
     data: &PyReadonlyArray2<'_, T>,
     channel: usize,
@@ -578,6 +679,7 @@ fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;
     module.add_function(wrap_pyfunction!(dmtime, module)?)?;
+    module.add_function(wrap_pyfunction!(rfi_stats, module)?)?;
     Ok(())
 }
 
