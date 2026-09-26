@@ -280,6 +280,22 @@ class SigprocFile(object):
 
         return (self._mmdata.size() - self.hdrbytes) / self.bytes_per_spectrum
 
+    def _read_data(self, start, size):
+        preadv = getattr(os, "preadv", None)
+        if self.fp.closed or preadv is None:
+            return numpy.frombuffer(
+                memoryview(self._mmdata)[start : start + size], dtype=numpy.uint8
+            ).copy()
+        data = numpy.empty(size, dtype=numpy.uint8)
+        view = memoryview(data)
+        done = 0
+        while done < size:
+            read = preadv(self.fp.fileno(), [view[done:]], start + done)
+            if not read:
+                break
+            done += read
+        return data[:done]
+
     def get_data(self, nstart, nsamp, offset=0, pol=0, npoln=1):
         """
         Return nsamp time slices starting at nstart.
@@ -301,9 +317,13 @@ class SigprocFile(object):
         b0 = self.hdrbytes + bstart + (offset * self.bytes_per_spectrum)
         b1 = b0 + nbytes
 
-        data = numpy.frombuffer(
-            self._mmdata[int(b0) : int(b1)], dtype=self.dtype
-        ).reshape((-1, self.nifs, self.nchans))
+        start, stop, _ = slice(int(b0), int(b1)).indices(len(self._mmdata))
+        data = (
+            numpy.frombuffer(
+                self._read_data(start, max(0, stop - start)), dtype=self.dtype
+            )
+            .reshape((-1, self.nifs, self.nchans))
+        )
 
         if self.nifs == 1:
             return data

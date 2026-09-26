@@ -7,6 +7,8 @@ Read PSRFITS data.
 Original Source: https://github.com/scottransom/presto/blob/master/python/presto/psrfits.py
 """
 
+import contextlib
+from operator import index
 import logging
 import os
 import os.path
@@ -110,7 +112,11 @@ class PsrfitsFile(object):
         self.fileid = 0
 
         self.fits = pyfits.open(psrfitsfn, mode="readonly", memmap=True)
-        self.specinfo = SpectraInfo(psrfitslist)
+        try:
+            self.specinfo = SpectraInfo(psrfitslist, _first_hdu=self.fits)
+        except Exception:
+            self.fits.close()
+            raise
         self.header = self.fits[0].header  # Primary HDU
         self.nbits = self.specinfo.bits_per_sample
         self.nchan = self.specinfo.num_channels
@@ -200,6 +206,8 @@ class PsrfitsFile(object):
         apply_offsets=True,
         pol=0,
         npoln=1,
+        *,
+        time_range=None,
     ):
         """
         Read a PSRFITS subint from a open pyfits file object.
@@ -207,6 +215,7 @@ class PsrfitsFile(object):
 
         Args:
             isub (int): index of subint (first subint is 0)
+            time_range (tuple): Optional (start, stop) sample bounds within the subint.
             apply_weights (bool): If True, apply weights. (Default: apply weights)
             apply_scales (bool): If True, apply scales. (Default: apply scales)
             apply_offsets (bool): If True, apply offsets. (Default: apply offsets)
@@ -219,6 +228,12 @@ class PsrfitsFile(object):
         """
         sdata = self.fits["SUBINT"].data[isub]["DATA"]
         shp = sdata.squeeze().shape
+        nsamp = self.nsamp_per_subint
+        sliced = False
+        if time_range is not None:
+            start, stop = map(index, time_range)
+            if not 0 <= start <= stop <= nsamp:
+                raise ValueError("expected 0 <= start <= stop <= subint length")
 
         assert npoln <= self.npoln, (
             f"npoln ({npoln})  should be less than or equal to number of polarizations in the "
@@ -230,7 +245,7 @@ class PsrfitsFile(object):
                 "Polarisation order in the file should be IQUV with pol=1 or pol=2"
             )
 
-        if self.nbits < 8:  # Unpack the bytes data
+        if self.nbits < 8:
             if len(shp) == 2:
                 if (shp[0] != self.nsamp_per_subint) and (
                     shp[1] != self.nchan * self.nbits / 8
@@ -238,6 +253,23 @@ class PsrfitsFile(object):
                     sdata = sdata.reshape(
                         self.nsamp_per_subint, int(self.nchan * self.nbits / 8)
                     )
+
+        if time_range is not None:
+            # Slice only standard, byte-aligned single-polarization layouts.
+            if (
+                self.npoln == npoln == 1
+                and pol == 0
+                and self.nbits in (2, 4, 8, 16, 32)
+                and self.nchan * self.nbits % 8 == 0
+                and sdata.ndim > 1
+                and sdata.shape[0] == nsamp
+                and sdata.size * max(1, 8 // self.nbits) == nsamp * self.nchan
+            ):
+                sdata = sdata[start:stop]
+                nsamp = stop - start
+                sliced = True
+
+        if self.nbits < 8:  # Unpack the bytes data
             if self.nbits == 4:
                 data = unpack_4bit(sdata)
             elif self.nbits == 2:
@@ -246,20 +278,18 @@ class PsrfitsFile(object):
                 data = np.asarray(sdata)
         elif npoln == 4:
             data = sdata.squeeze()
-            data = data.reshape((self.nsamp_per_subint, self.npoln, self.nchan)).astype(
-                np.float32
-            )
+            data = data.reshape((nsamp, self.npoln, self.nchan))
         else:
             # Handle 4-poln GUPPI/PUPPI data
             if len(shp) == 3 and shp[1] == self.npoln and self.poln_order == "AABBCRCI":
                 logger.warning("Polarization is AABBCRCI, summing AA and BB")
-                data = np.zeros((self.nsamp_per_subint, self.nchan), dtype=np.float32)
+                data = np.zeros((nsamp, self.nchan), dtype=np.float32)
                 data += sdata[:, 0, :].squeeze()
                 data += sdata[:, 1, :].squeeze()
                 data *= 0.5
             elif len(shp) == 3 and shp[1] == self.npoln and self.poln_order == "IQUV":
                 logger.warning("Polarization is IQUV")
-                data = np.zeros((self.nsamp_per_subint, self.nchan), dtype=np.float32)
+                data = np.zeros((nsamp, self.nchan), dtype=np.float32)
                 if pol == 0:
                     logger.info("Just using Stokes I.")
                     data += sdata[:, 0, :].squeeze()
@@ -279,7 +309,7 @@ class PsrfitsFile(object):
                     raise ValueError(f"pol={pol} value not supported.")
             elif len(shp) == 3 and shp[1] == self.npoln and self.poln_order == "AABB":
                 logger.warning("Polarization is AABB, summing AA and BB")
-                data = np.zeros((self.nsamp_per_subint, self.nchan), dtype=np.float32)
+                data = np.zeros((nsamp, self.nchan), dtype=np.float32)
                 data += sdata[:, 0, :].squeeze()
                 data += sdata[:, 1, :].squeeze()
                 data *= 0.5
@@ -288,13 +318,13 @@ class PsrfitsFile(object):
                     "Data is packed as two uint8 arrays. Concatenating them to get uint16."
                 )
                 logger.warning("Polarization is IQUV. Just using Stokes I.")
-                data = np.zeros((self.nsamp_per_subint, self.nchan), dtype=np.float32)
+                data = np.zeros((nsamp, self.nchan), dtype=np.float32)
                 data1 = sdata[:, 0, :, 0].astype(np.uint16)
                 data2 = sdata[:, 0, :, 1].astype(np.uint16)
                 data += np.left_shift(data2, 8) + data1
             else:
                 data = np.asarray(sdata)
-        data = data.reshape((self.nsamp_per_subint, npoln, self.nchan)).astype(
+        data = data.reshape((nsamp, npoln, self.nchan)).astype(
             np.float32
         )
         if apply_scales:
@@ -303,6 +333,8 @@ class PsrfitsFile(object):
             data += self.get_offsets(isub)[: self.nchan]
         if apply_weights:
             data *= self.get_weights(isub)[: self.nchan]
+        if time_range is not None and not sliced:
+            return data[start:stop].copy()
         return data
 
     def get_weights(self, isub):
@@ -391,6 +423,14 @@ class PsrfitsFile(object):
             logger.debug(f"File id is {self.fileid}, Reading file: {self.filename}")
             self.fits = pyfits.open(self.filename, mode="readonly", memmap=True)
 
+        windowed = (
+            nstart >= 0 and nsamp >= 0 and skip >= 0 and trunc >= 0
+            and startsub <= endsub
+            and self.npoln == npoln == 1 and pol == 0
+            and self.nbits in (2, 4, 8, 16, 32)
+            and self.nchan * self.nbits % 8 == 0
+            and getattr(self.read_subint, "__func__", None) is PsrfitsFile.read_subint
+        )
         # Read data
         data = []
         logger.debug(f"Startsub {startsub}, endsub {endsub}")
@@ -421,31 +461,49 @@ class PsrfitsFile(object):
                 (isub - np.concatenate([np.array([0]), cumsum_num_subint]))[self.fileid]
             )
             logger.debug(f"Reading subint {fsub} in file {self.filename}")
+            read_kwargs = dict(pol=pol, npoln=npoln)
+            if windowed:
+                read_kwargs["time_range"] = (
+                    skip if isub == startsub else 0,
+                    self.nsamp_per_subint - (trunc if isub == endsub else 0),
+                )
             try:
-                data.append(self.read_subint(fsub, pol=pol, npoln=npoln))
+                data.append(self.read_subint(fsub, **read_kwargs))
             except KeyError:
                 logger.warning("Encountered KeyError, maybe mmap'd object was delected")
                 logger.debug(f"Trying to open file {self.filename}")
                 self.fits = pyfits.open(self.filename, mode="readonly", memmap=True)
                 logger.debug(f"Reading subint {fsub} in file {self.filename}")
-                data.append(self.read_subint(fsub, pol=pol, npoln=npoln))
+                data.append(self.read_subint(fsub, **read_kwargs))
 
         logging.debug("Read all the necessary subints")
-        if len(data) > 1:
-            data = np.concatenate(data)
+        if windowed:
+            return data[0] if len(data) == 1 else np.concatenate(data)
+        if nstart >= 0 and nsamp >= 0 and skip >= 0 and trunc >= 0:
+            end = -trunc if trunc else None
+            if len(data) == 1:
+                data = data[0][skip:end, :, :].copy()
+            else:
+                data[0] = data[0][skip:, :, :]
+                if trunc:
+                    data[-1] = data[-1][:-trunc, :, :]
+                data = np.concatenate(data)
         else:
-            data = np.array(data)[0, :, :, :]
+            if len(data) > 1:
+                data = np.concatenate(data)
+            else:
+                data = np.array(data)[0, :, :, :]
 
-        # data shape is (nt, 1, nf) or (nt, nifs, nf)
+            # data shape is (nt, 1, nf) or (nt, nifs, nf)
 
-        # data = np.transpose(data)
-        # Truncate data to desired interval
-        if trunc > 0:
-            data = data[skip:-trunc, :, :]
-        elif trunc == 0:
-            data = data[skip:, :, :]
-        else:
-            raise ValueError("Number of bins to truncate is negative: %d" % trunc)
+            # data = np.transpose(data)
+            # Truncate data to desired interval
+            if trunc > 0:
+                data = data[skip:-trunc, :, :]
+            elif trunc == 0:
+                data = data[skip:, :, :]
+            else:
+                raise ValueError("Number of bins to truncate is negative: %d" % trunc)
         #         if not self.specinfo.need_flipband:
         #             # for psrfits module freqs go from low to high.
         #             # spectra module expects high frequency first.
@@ -465,7 +523,7 @@ class SpectraInfo:
         filenames (list): list of fits files
     """
 
-    def __init__(self, filenames):
+    def __init__(self, filenames, *, _first_hdu=None):
         self.filenames = filenames
         self.num_files = len(filenames)
         self.N = 0
@@ -491,9 +549,12 @@ class SpectraInfo:
                 raise ValueError("File '%s' does not appear to be PSRFITS!" % fn)
 
             # Open the PSRFITS file
-            with pyfits.open(
-                fn, mode="readonly", memmap=True, ignore_missing_end=True
-            ) as hdus:
+            hdu_context = (
+                contextlib.nullcontext(_first_hdu)
+                if ii == 0 and _first_hdu is not None
+                else pyfits.open(fn, mode="readonly", memmap=True, ignore_missing_end=True)
+            )
+            with hdu_context as hdus:
                 hdus.verify()
 
                 if ii == 0:
