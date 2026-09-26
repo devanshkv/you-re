@@ -47,8 +47,14 @@ fn pairwise_squared_deviations(values: &[u8], mean: f64) -> f64 {
         0..8 => values.iter().fold(-0.0, |sum, &value| sum + squared(value)),
         8..=PAIRWISE_BLOCK => {
             let mut sums = [
-                squared(values[0]), squared(values[1]), squared(values[2]), squared(values[3]),
-                squared(values[4]), squared(values[5]), squared(values[6]), squared(values[7]),
+                squared(values[0]),
+                squared(values[1]),
+                squared(values[2]),
+                squared(values[3]),
+                squared(values[4]),
+                squared(values[5]),
+                squared(values[6]),
+                squared(values[7]),
             ];
             let full = values.len() - values.len() % 8;
             let mut index = 8;
@@ -75,11 +81,19 @@ fn pairwise_squared_deviations(values: &[u8], mean: f64) -> f64 {
     }
 }
 
+type RfiStats<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    u64,
+    u64,
+    f64,
+);
+
 #[pyfunction]
 fn rfi_stats<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, u8>,
-) -> PyResult<Option<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, u64, u64, f64)>> {
+) -> PyResult<Option<RfiStats<'py>>> {
     if !data.is_c_contiguous() {
         return Ok(None);
     }
@@ -167,8 +181,7 @@ fn fill_dedispersed<T, I>(
     delays: I,
     start: usize,
     output: &mut [f32],
-)
-where
+) where
     T: Element + Copy + ToF32,
     I: Clone + Iterator<Item = i64>,
 {
@@ -216,12 +229,7 @@ where
     }
 }
 
-fn add_packed_channel<T: Copy + ToF32>(
-    column: &[T],
-    delay: i64,
-    start: usize,
-    output: &mut [f32],
-) {
+fn add_packed_channel<T: Copy + ToF32>(column: &[T], delay: i64, start: usize, output: &mut [f32]) {
     let nt = column.len();
     let pivot = if delay >= nt as i64 || delay <= -(nt as i64) {
         0
@@ -246,8 +254,7 @@ fn add_packed_channel<T: Copy + ToF32>(
 
 fn fill_dmtime_packed<T: Copy + ToF32>(
     data: &[T],
-    nt: usize,
-    nf: usize,
+    (nt, nf): (usize, usize),
     dm_values: &PyReadonlyArray1<'_, f64>,
     frequency_term: &PyReadonlyArray1<'_, f64>,
     tsamp: f64,
@@ -280,9 +287,7 @@ fn fill_dmtime_packed<T: Copy + ToF32>(
         for (row_index, &dm) in dm_values.iter().enumerate() {
             let row = &mut output[row_index * length..(row_index + 1) * length];
             for (channel, &term) in terms.iter().skip(channel_start).take(width).enumerate() {
-                let delay = numpy_i64(
-                    ((4148808.0 * dm) * term / 1000.0 / tsamp).round_ties_even(),
-                );
+                let delay = numpy_i64(((4148808.0 * dm) * term / 1000.0 / tsamp).round_ties_even());
                 add_packed_channel(&packed[channel * nt..(channel + 1) * nt], delay, start, row);
             }
         }
@@ -437,7 +442,7 @@ fn numpy_i64(value: f64) -> i64 {
     const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
     const I64_MAX_F64: f64 = 9_223_372_036_854_775_808.0;
 
-    if value.is_finite() && value >= I64_MIN_F64 && value < I64_MAX_F64 {
+    if value.is_finite() && (I64_MIN_F64..I64_MAX_F64).contains(&value) {
         value as i64
     } else {
         i64::MIN
@@ -477,23 +482,23 @@ fn dmtime_array<'py, T: Element + Copy + ToF32>(
         .map_err(|_| PyMemoryError::new_err("dmtime output is too large"))?;
     output.resize(total, 0.0_f32);
     // Packing visits the full input; keep sparse requests on the existing path.
-    let packed = if count > 1 && length > 0 && nt > 0 && nf > 0 && nt <= total && data.is_c_contiguous() {
-        match data.as_slice() {
-            Ok(contiguous) => fill_dmtime_packed(
-                contiguous,
-                nt,
-                nf,
-                dm_values,
-                frequency_term,
-                tsamp,
-                start,
-                &mut output,
-            ),
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    let packed =
+        if count > 1 && length > 0 && nt > 0 && nf > 0 && nt <= total && data.is_c_contiguous() {
+            match data.as_slice() {
+                Ok(contiguous) => fill_dmtime_packed(
+                    contiguous,
+                    (nt, nf),
+                    dm_values,
+                    frequency_term,
+                    tsamp,
+                    start,
+                    &mut output,
+                ),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
     if !packed {
         let mut delays = Vec::new();
         delays
@@ -503,9 +508,7 @@ fn dmtime_array<'py, T: Element + Copy + ToF32>(
 
         for (row_index, &dm) in dm_values_array.iter().enumerate() {
             for (delay, &term) in delays.iter_mut().zip(terms.iter()) {
-                *delay = numpy_i64(
-                    ((4148808.0 * dm) * term / 1000.0 / tsamp).round_ties_even(),
-                );
+                *delay = numpy_i64(((4148808.0 * dm) * term / 1000.0 / tsamp).round_ties_even());
             }
             let row = &mut output[row_index * length..(row_index + 1) * length];
             fill_dedispersed(&data, delays.iter().copied(), start, row);
