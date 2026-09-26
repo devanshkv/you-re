@@ -22,6 +22,8 @@ def plot_h5(
     mad_filter=False,
     dpi=300,
     outdir=None,
+    *,
+    output_format="png",
 ):
     """
     Plot the h5 candidates
@@ -29,16 +31,20 @@ def plot_h5(
     Args:
         mad_filter (int): use MAD filter to clip data
         h5_file (str): Name of the h5 file
-        save (bool): Save the file as a png
+        save (bool): Save the plot
         detrend_ft (bool): detrend the frequency time plot
         publication (bool): make publication quality plot
-        dpi (int): DPI of output png (default: 300)
+        dpi (int): DPI of output image (default: 300)
         outdir (str): Path to the save the files into.
+        output_format (str): "png" (default) or "jpeg". JPEG uses quality 95
+            with no chroma subsampling (4:4:4).
 
     Returns:
         None
 
     """
+    if output_format not in ("png", "jpeg"):
+        raise ValueError('output_format must be "png" or "jpeg"')
     with h5py.File(h5_file, "r") as f:
         dm_time = np.array(f["data_dm_time"])
         if detrend_ft:
@@ -120,11 +126,18 @@ def plot_h5(
 
         plt.tight_layout()
         if save:
+            extension = ".jpg" if output_format == "jpeg" else ".png"
+            filename = os.path.splitext(os.fspath(h5_file))[0] + extension
             if outdir:
-                filename = outdir + os.path.basename(h5_file)[:-3] + ".png"
-            else:
-                filename = h5_file[:-3] + ".png"
-            plt.savefig(filename, bbox_inches="tight", dpi=dpi)
+                filename = os.path.join(outdir, os.path.basename(filename))
+            save_options = {}
+            if output_format == "jpeg":
+                save_options["pil_kwargs"] = {
+                    "quality": 95,
+                    "subsampling": 0,
+                    "optimize": False,
+                }
+            fig.savefig(filename, bbox_inches="tight", dpi=dpi, **save_options)
 
         plt.close()
 
