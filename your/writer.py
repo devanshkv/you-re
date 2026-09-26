@@ -2,9 +2,9 @@
 
 import logging
 import os
+from operator import index
 
 import numpy as np
-from astropy.io import fits
 from astropy.time import Time
 from rich.progress import Progress
 
@@ -261,12 +261,14 @@ class Writer:
                     max_value,
                 )
 
-        data = data.astype(self.your_object.your_header.dtype)
+        if data.dtype != self.your_object.your_header.dtype:
+            data = data.astype(self.your_object.your_header.dtype)
 
         # shape of data is (nt, npoln, nf)
         if self.highest_frequency_first and self.your_object.your_header.foff > 0:
             data = data[:, :, ::-1]
         self.data = data
+        return data
 
     def to_fil(self, data=None):
         """
@@ -290,13 +292,8 @@ class Writer:
                 "be needed. "
             )
 
-        with Progress() as progress:
-            if not self.progress:
-                task = progress.add_task(
-                    "[green]Writing...", total=self.nsamp, visible=False
-                )
-            else:
-                task = progress.add_task("[green]Writing...", total=self.nsamp)
+        with Progress(disable=not self.progress) as progress:
+            task = progress.add_task("[green]Writing...", total=self.nsamp)
             # create the header
             sigproc_object = sigproc_object_from_writer(self)
 
@@ -342,106 +339,42 @@ class Writer:
         logging.debug("Wrote all the necessary spectra")
 
     def to_fits(self, npsub=-1):
-        """
-        Writes out a PSRFITS file
-
-        Args:
-            npsub (int): number of spectra per subint
-
-        """
-
+        """Write a PSRFITS file in bounded subintegration chunks."""
+        npsub = index(npsub)
+        if npsub != -1 and npsub <= 0:
+            raise ValueError("npsub must be positive or -1 for automatic sizing")
+        if self.nstart < 0:
+            raise ValueError("nstart must be non-negative")
         tsamp = self.your_object.your_header.tsamp
-
-        if npsub == -1:
-            npsub = int(1.0 / tsamp)
-        else:
-            pass
-
-        if self.nsamp:
-            if self.nsamp < npsub:
-                npsub = self.nsamp
-
-        outfile = self.outdir + "/" + self.outname + ".fits"
-
-        initialize_psrfits(
-            outfile=outfile,
-            your_object=self.your_object,
-            npsub=npsub,
-            nstart=self.nstart,
-            nsamp=self.nsamp,
-            chan_freqs=self.chan_freqs,
-            npoln=self.npoln,
-            poln_order=self.poln_order,
+        if npsub <= 0:
+            npsub = max(1, int(1.0 / tsamp))
+        nsamp = min(
+            self.nsamp, max(0, self.your_object.your_header.nspectra - self.nstart)
         )
+        if nsamp and nsamp < npsub:
+            npsub = nsamp
+        outfile = self.outdir + "/" + self.outname + ".fits"
+        nsubints = (nsamp + npsub - 1) // npsub
 
-        nifs = self.npoln  # self.your_object.your_header.npol
+        with Progress(disable=not self.progress) as progress:
+            task = progress.add_task("[green]Writing...", total=nsubints)
 
-        logger.info("Filling PSRFITS file with data")
+            def read_chunk(start_sample, samples):
+                data = self.get_data_to_write(start_sample, samples)
+                progress.update(task, advance=(samples + npsub - 1) // npsub)
+                return data
 
-        # Open PSRFITS file
-        hdulist = fits.open(outfile, mode="update")
-        hdu = hdulist[1]
-        nsubints = len(hdu.data[:]["data"])
-
-        # Loop through chunks of data to write to PSRFITS
-        n_read_subints = 10
-        logger.info(f"Number of subints to write {nsubints}")
-
-        st = self.nstart
-        with Progress() as progress:
-            if not self.progress:
-                task = progress.add_task(
-                    "[green]Writing...", total=nsubints, visible=False
-                )
-            else:
-                task = progress.add_task("[green]Writing...", total=nsubints)
-
-            for istart in np.arange(0, nsubints, n_read_subints):
-                istop = istart + n_read_subints
-                if istop > nsubints:
-                    istop = nsubints
-                else:
-                    pass
-                isub = istop - istart
-
-                logger.info(
-                    f"Writing data to {outfile} from subint = {istart} to {istop}."
-                )
-
-                # Read in nread samples from filfile
-                nread = isub * npsub
-                self.get_data_to_write(st, nread)
-                progress.update(task, advance=n_read_subints)
-                data = self.data
-                st += nread
-
-                nvals = isub * npsub  # * nifs
-                if data.shape[0] < nvals:
-                    logger.debug(
-                        f"nspectra in this chunk ({data.shape[0]}) < nsubints * npsub ({nvals})"
-                    )
-                    logger.debug("Appending zeros at the end to fill the subint")
-                    pad_back = np.zeros(
-                        (nvals - data.shape[0], data.shape[1], data.shape[2])
-                    )
-                    data = np.vstack((data, pad_back))
-                else:
-                    pass
-
-                data = np.reshape(data, (isub, npsub, nifs, self.nchans))
-
-                # Put data in hdu data array
-                logger.debug(f"Writing data of shape {data.shape} to {outfile}.")
-                hdu.data[istart:istop]["data"][:, :, :, :] = data[:].astype(
-                    self.your_object.your_header.dtype
-                )
-
-            # Write to file
-            hdulist.flush()
-
-        logger.info(f"All spectra written to {outfile}")
-        # Close open FITS file
-        hdulist.close()
+            initialize_psrfits(
+                outfile=outfile,
+                your_object=self.your_object,
+                npsub=npsub,
+                nstart=self.nstart,
+                nsamp=nsamp,
+                chan_freqs=self.chan_freqs,
+                npoln=self.npoln,
+                poln_order=self.poln_order,
+                data_reader=read_chunk,
+            )
 
     def dada_header(self):
         """

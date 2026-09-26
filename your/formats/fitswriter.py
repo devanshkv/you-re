@@ -5,6 +5,8 @@ Original Source: https://github.com/rwharton/fil2psrfits
 """
 
 import logging
+import os
+from operator import index
 
 import astropy.coordinates as coord
 import astropy.time as time
@@ -23,8 +25,8 @@ class ObsInfo(object):
 
     def __init__(self):
         self.file_date = self.format_date(time.Time.now().isot)
-        self.observer = "Human"
-        self.proj_id = "Awesome_Project"
+        self.observer = ""
+        self.proj_id = ""
         self.obs_date = ""
         self.fcenter = 0.0
         self.bw = 0.0
@@ -32,14 +34,14 @@ class ObsInfo(object):
         self.src_name = ""
         self.ra_str = "00:00:00"
         self.dec_str = "+00:00:00"
-        self.bmaj_deg = 0.0
-        self.bmin_deg = 0.0
-        self.bpa_deg = 0.0
+        self.bmaj_deg = None
+        self.bmin_deg = None
+        self.bpa_deg = None
         self.scan_len = 0
         self.stt_imjd = 0
         self.stt_smjd = 0
         self.stt_offs = 0.0
-        self.stt_lst = 0.0
+        self.stt_lst = None
 
         self.dt = 0.0
         self.nbits = 16
@@ -47,20 +49,34 @@ class ObsInfo(object):
         self.chan_bw = 0.0
         self.nsblk = 0
 
-        self.telescope = "VLA"
-        self.ant_x = -1601185.63
-        self.ant_y = -5041978.15
-        self.ant_z = 3554876.43
-        self.longitude = self.calc_longitude()
+        self.telescope = ""
+        self.ant_x = None
+        self.ant_y = None
+        self.ant_z = None
+        self.longitude = None
+        self.frontend = ""
+        self.nrcvr = None
+        self.fd_poln = ""
+        self.fd_hand = None
+        self.fd_sang = None
+        self.fd_xyph = None
+        self.backend = ""
+        self.beconfig = ""
+        self.be_phase = None
+        self.be_dcc = None
+        self.be_delay = None
+        self.tcycle = None
         self.npoln = 1
         self.poln_order = "AA+BB"
 
     def calc_longitude(self):
-        cc = coord.EarthLocation.from_geocentric(
-            self.ant_x, self.ant_y, self.ant_z, unit="m"
-        )
-        longitude = cc.lon.deg
-        return longitude
+        xyz = (self.ant_x, self.ant_y, self.ant_z)
+        try:
+            if any(value is None or not np.isfinite(value) for value in xyz):
+                return None
+        except TypeError:
+            return None
+        return coord.EarthLocation.from_geocentric(*xyz, unit="m").lon.deg
 
     def fill_from_mjd(self, mjd):
         stt_imjd = int(mjd)
@@ -92,7 +108,9 @@ class ObsInfo(object):
         self.nbits = nbits
 
     def calc_start_lst(self, mjd):
-        self.stt_lst = self.calc_lst(mjd, self.longitude)
+        self.stt_lst = (
+            None if self.longitude is None else self.calc_lst(mjd, self.longitude)
+        )
 
     def calc_lst(self, mjd, longitude):
         gfac0 = 6.697374558
@@ -145,20 +163,44 @@ class ObsInfo(object):
         p_hdr["ANT_Y"] = (self.ant_y, "[m] Antenna ITRF Y-coordinate (D)            ")
         p_hdr["ANT_Z"] = (self.ant_z, "[m] Antenna ITRF Z-coordinate (D)            ")
         p_hdr["FRONTEND"] = (
-            "                ",
+            self.frontend,
             "Rx and feed ID                               ",
         )
-        p_hdr["NRCVR"] = (1, "Number of receiver polarisation channels     ")
-        p_hdr["FD_POLN"] = ("CIRC", "LIN or CIRC                                  ")
-        p_hdr["FD_HAND"] = (-1, "+/- 1. +1 is LIN:A=X,B=Y, CIRC:A=L,B=R (I)   ")
-        p_hdr["FD_SANG"] = (45.0, "[deg] FA of E vect for equal sigma in A&B (E)  ")
-        p_hdr["FD_XYPH"] = (0.0, "[deg] Phase of A^* B for injected cal (E)    ")
-        p_hdr["BACKEND"] = ("YUPPI", "Backend ID                                   ")
-        p_hdr["BECONFIG"] = ("N/A", "Backend configuration file name              ")
-        p_hdr["BE_PHASE"] = (-1, "0/+1/-1 BE cross-phase:0 unknown,+/-1 std/rev")
-        p_hdr["BE_DCC"] = (0, "0/1 BE downconversion conjugation corrected  ")
-        p_hdr["BE_DELAY"] = (0.0, "[s] Backend propn delay from digitiser input ")
-        p_hdr["TCYCLE"] = (0.0, "[s] On-line cycle time (D)                   ")
+        p_hdr["NRCVR"] = (self.nrcvr, "Number of receiver polarisation channels     ")
+        p_hdr["FD_POLN"] = (
+            self.fd_poln,
+            "LIN or CIRC                                  ",
+        )
+        p_hdr["FD_HAND"] = (
+            self.fd_hand,
+            "+/- 1. +1 is LIN:A=X,B=Y, CIRC:A=L,B=R (I)   ",
+        )
+        p_hdr["FD_SANG"] = (
+            self.fd_sang,
+            "[deg] FA of E vect for equal sigma in A&B (E)  ",
+        )
+        p_hdr["FD_XYPH"] = (
+            self.fd_xyph,
+            "[deg] Phase of A^* B for injected cal (E)    ",
+        )
+        p_hdr["BACKEND"] = (
+            self.backend,
+            "Backend ID                                   ",
+        )
+        p_hdr["BECONFIG"] = (
+            self.beconfig,
+            "Backend configuration file name              ",
+        )
+        p_hdr["BE_PHASE"] = (
+            self.be_phase,
+            "0/+1/-1 BE cross-phase:0 unknown,+/-1 std/rev",
+        )
+        p_hdr["BE_DCC"] = (self.be_dcc, "0/1 BE downconversion conjugation corrected  ")
+        p_hdr["BE_DELAY"] = (
+            self.be_delay,
+            "[s] Backend propn delay from digitiser input ",
+        )
+        p_hdr["TCYCLE"] = (self.tcycle, "[s] On-line cycle time (D)                   ")
         p_hdr["OBS_MODE"] = ("SEARCH", "(PSR, CAL, SEARCH)                           ")
         p_hdr["DATE-OBS"] = (
             self.obs_date,
@@ -268,51 +310,55 @@ def initialize_psrfits(
     chan_freqs=None,
     npoln=1,
     poln_order="AA+BB",
+    data_reader=None,
+    chunk_rows=10,
 ):
+    """Create a PSRFITS file, optionally filling DATA as bounded row chunks.
+
+    ``data_reader`` receives ``(start_sample, nsamp)`` and must return data
+    shaped ``(nsamp, npoln, nchans)``. Without it this keeps the public
+    initializer's zero-filled DATA behavior.
     """
-    Set up a PSRFITS file with everything set up EXCEPT
-    the DATA.
-
-    Args:
-        outfile: path to the output fits file to write to
-        your_object: your object with the input Filterbank file
-        npsub: number of spectra in a subint
-        nstart: start sample to read from (for the input file)
-        nsamp: number of spectra to read
-        chan_freqs: array with frequencies of all the channels
-        npoln: number of polarisations in the output file
-        poln_order: polsarisation order
-
-    """
-
-    # Obs Specific Metadata
-    # Time Info
     nbits = your_object.your_header.nbits
-    mjd = your_object.your_header.tstart
-    tsamp = your_object.your_header.tsamp  # seconds
+    tsamp = your_object.your_header.tsamp
+    nstart = 0 if nstart is None else index(nstart)
+    nsamp = None if nsamp is None else index(nsamp)
+    npsub = index(npsub)
+    chunk_rows = index(chunk_rows)
+    if npsub != -1 and npsub <= 0:
+        raise ValueError("npsub must be positive or -1 for automatic sizing")
+    sources = getattr(your_object, "your_file", your_object.your_header.filename)
+    if isinstance(sources, (str, os.PathLike)):
+        sources = [sources]
+    for source in sources:
+        if os.path.realpath(outfile) == os.path.realpath(source) or (
+            os.path.exists(outfile)
+            and os.path.exists(source)
+            and os.path.samefile(outfile, source)
+        ):
+            raise ValueError("PSRFITS output must not overwrite its input")
+    if nstart < 0:
+        raise ValueError("nstart must be non-negative")
+    available = max(0, your_object.your_header.nspectra - nstart)
+    nsamps = available if nsamp is None else min(nsamp, available)
+    if nsamps < 0:
+        raise ValueError("nsamp must be non-negative")
+    if nsamp is not None and nsamp > available:
+        logging.warning(
+            "Data requested exceeds the length of file. Reading data till end of file."
+        )
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
+    mjd = your_object.your_header.tstart + nstart * tsamp / (24 * 60 * 60)
 
-    if nsamp:
-        nsamps = nsamp
-    else:
-        nsamps = your_object.your_header.nspectra
-
-    if nstart:
-        mjd += nstart * tsamp / (24 * 60 * 60)
-        if nstart + nsamps > your_object.your_header.nspectra:
-            logging.warning(
-                "Data requested exceeds the length of file. Reading data till end of file."
-            )
-            nsamps = your_object.your_header.nspectra - nstart
-
-    # Frequency Info (All freqs in MHz)
-    if not chan_freqs.all():
+    if chan_freqs is None:
         chan_freqs = your_object.chan_freqs
+    chan_freqs = np.asarray(chan_freqs)
+    if not len(chan_freqs):
+        raise ValueError("chan_freqs must contain at least one channel")
     nchans = len(chan_freqs)
-    fch1 = chan_freqs[0]
-    foff = your_object.your_header.foff
-
-    freqs = fch1 + np.arange(nchans) * foff
-    fcenter = fch1 + nchans * foff / 2
+    fcenter = (chan_freqs[0] + chan_freqs[-1]) / 2
+    foff = chan_freqs[1] - chan_freqs[0] if nchans > 1 else your_object.your_header.foff
 
     if npoln == 4:
         if your_object.your_header.npol == 4:
@@ -320,7 +366,7 @@ def initialize_psrfits(
         else:
             logger.warning(
                 f"Number of polarisations in the data {your_object.your_header.npol} is not equal to 4."
-                f"Only writing 1 polarisation."
+                "Only writing 1 polarisation."
             )
             nifs = 1
     elif npoln == 1:
@@ -330,163 +376,189 @@ def initialize_psrfits(
             "npoln can only be 1 (for one polarisation) or 4 (for all polarisations)."
         )
 
-    # Source Info
     src_name = your_object.your_header.source_name
-
     from astropy.coordinates import SkyCoord
 
-    if your_object.your_header.ra_deg and your_object.your_header.dec_deg:
-        ra = your_object.your_header.ra_deg
-        dec = your_object.your_header.dec_deg
-    else:
-        ra = 0
-        dec = 0
-
+    ra = your_object.your_header.ra_deg
+    dec = your_object.your_header.dec_deg
+    ra = 0.0 if ra is None else ra
+    dec = 0.0 if dec is None else dec
     loc = SkyCoord(ra, dec, unit="deg")
-    ra_hms = loc.ra.hms
-    dec_dms = loc.dec.dms
-
-    ra_str = (
-        f"{int(ra_hms[0]):02d}:{np.abs(int(ra_hms[1])):02d}:{np.abs(ra_hms[2]):07.4f}"
+    ra_str = loc.ra.to_string(unit="hourangle", sep=":", pad=True, precision=4)
+    dec_str = loc.dec.to_string(
+        unit="deg", sep=":", pad=True, alwayssign=True, precision=4
     )
-    dec_str = f"{int(dec_dms[0]):02d}:{np.abs(int(dec_dms[1])):02d}:{np.abs(dec_dms[2]):07.4f}"
 
-    # Beam Info
-    beam_info = np.array([0.0, 0.0, 0.0])
-    bmaj_deg = beam_info[0] / 3600.0
-    bmin_deg = beam_info[1] / 3600.0
-    bpa_deg = beam_info[2]
-
-    # Fill in the ObsInfo class
     d = ObsInfo()
+    input_header = your_object.fits[0].header if your_object.format == "fits" else None
+    provenance_cards = (
+        "OBSERVER",
+        "PROJID",
+        "TELESCOP",
+        "ANT_X",
+        "ANT_Y",
+        "ANT_Z",
+        "FRONTEND",
+        "NRCVR",
+        "FD_POLN",
+        "FD_HAND",
+        "FD_SANG",
+        "FD_XYPH",
+        "BACKEND",
+        "BECONFIG",
+        "BE_PHASE",
+        "BE_DCC",
+        "BE_DELAY",
+        "TCYCLE",
+        "BMAJ",
+        "BMIN",
+        "BPA",
+    )
+    if input_header is not None:
+        d.ant_x, d.ant_y, d.ant_z = (
+            input_header.get(k) for k in ("ANT_X", "ANT_Y", "ANT_Z")
+        )
+        d.longitude = d.calc_longitude()
+    else:
+        d.telescope = {1: "Arecibo", 6: "GBT"}.get(
+            getattr(your_object, "telescope_id", None), ""
+        )
     d.fill_from_mjd(mjd)
     d.fill_freq_info(fcenter, nchans, foff)
     d.fill_source_info(src_name, ra_str, dec_str)
-    d.fill_beam_info(bmaj_deg, bmin_deg, bpa_deg)
+    d.fill_beam_info(None, None, None)
     d.fill_data_info(tsamp, nbits)
     d.calc_start_lst(mjd)
     d.set_pol(npol=nifs, poln_order=poln_order)
 
-    logging.info("ObsInfo updated with relevant parameters")
-
-    # Determine subint size for PSRFITS table
-    if npsub > 0:
-        n_per_subint = npsub
-    else:
-        n_per_subint = int(1.0 / tsamp)
-
-    n_subints = int(nsamps / n_per_subint)
-    if nsamps % n_per_subint:
-        n_subints += 1
-
-    tstart = 0.0
+    n_per_subint = npsub if npsub > 0 else max(1, int(1.0 / tsamp))
+    n_subints = (nsamps + n_per_subint - 1) // n_per_subint
     t_subint = n_per_subint * tsamp
     d.nsblk = n_per_subint
     d.scan_len = t_subint * n_subints
 
-    tsubint = np.ones(n_subints, dtype=np.float64) * t_subint
-    offs_sub = (np.arange(n_subints) + 0.5) * t_subint + tstart
-
     logger.info(
         f"Setting the following info to be written in {outfile} \n {json.dumps(vars(d), indent=4, sort_keys=True)}"
     )
-
-    # Fill in the headers
     phdr = d.fill_primary_header()
-    thdr = d.fill_table_header()
-    fits_data = fits.HDUList()
-    data = np.array([], dtype=your_object.your_header.dtype)
-
-    # Prepare arrays for columns
-    lst_sub = np.array(
-        [d.calc_lst(mjd + tsub / (24.0 * 3600.0), d.longitude) for tsub in offs_sub],
-        dtype=np.float64,
-    )
-    ra_deg, dec_deg = your_object.your_header.ra_deg, your_object.your_header.dec_deg
-    l_deg, b_deg = your_object.your_header.gl, your_object.your_header.gb
-    ra_sub = np.ones(n_subints, dtype=np.float64) * ra_deg
-    dec_sub = np.ones(n_subints, dtype=np.float64) * dec_deg
-    glon_sub = np.ones(n_subints, dtype=np.float64) * l_deg
-    glat_sub = np.ones(n_subints, dtype=np.float64) * b_deg
-    fd_ang = np.zeros(n_subints, dtype=np.float32)
-    pos_ang = np.zeros(n_subints, dtype=np.float32)
-    par_ang = np.zeros(n_subints, dtype=np.float32)
-    tel_az = np.zeros(n_subints, dtype=np.float32)
-    tel_zen = np.zeros(n_subints, dtype=np.float32)
-    dat_freq = np.vstack([freqs] * n_subints).astype(np.float32)
-
-    dat_wts = np.ones((n_subints, nchans), dtype=your_object.your_header.dtype)
-    dat_offs = np.zeros((n_subints, nchans), dtype=your_object.your_header.dtype)
-    dat_scl = np.ones((n_subints, nchans), dtype=your_object.your_header.dtype)
-
-    # https://het.as.utexas.edu/HET/Software/Astropy-1.0/_modules/astropy/io/fits/column.html
-    # mapping from TFORM data type to numpy data type (code)
-    # L: Logical (Boolean)
-    # B: Unsigned Byte
-    # I: 16-bit Integer
-    # J: 32-bit Integer
-    # K: 64-bit Integer
-    # E: Single-precision Floating Point
-    # D: Double-precision Floating Point
-    # C: Single-precision Complex
-    # M: Double-precision Complex
-    # A: Character
-
-    dtype = your_object.your_header.dtype
-    if dtype == np.uint8:
-        data_format = "B"
-    elif dtype == np.int16:
-        data_format = "I"
-    elif dtype == np.int32:
-        data_format = "J"
-    elif dtype == np.int64:
-        data_format = "K"
-    elif dtype == np.float32:
-        data_format = "E"
-    elif dtype == np.float64:
-        data_format = "D"
+    if input_header is not None:
+        for card in provenance_cards:
+            if card in input_header:
+                phdr[card] = input_header[card]
+        for card in (
+            "OBSERVER",
+            "PROJID",
+            "TELESCOP",
+            "FRONTEND",
+            "FD_POLN",
+            "BACKEND",
+            "BECONFIG",
+        ):
+            if phdr[card] is None:
+                phdr[card] = ""
     else:
-        data_format = "E"
+        phdr.add_history(
+            "SIGPROC telescope_id=%r machine_id=%r"
+            % (
+                getattr(your_object, "telescope_id", None),
+                getattr(your_object, "machine_id", None),
+            )
+        )
+    thdr = d.fill_table_header()
+    ra_deg, dec_deg = ra, dec
+    l_deg, b_deg = your_object.your_header.gl, your_object.your_header.gb
+    l_deg = np.nan if l_deg is None else l_deg
+    b_deg = np.nan if b_deg is None else b_deg
 
-    # Make the columns
-    tbl_columns = [
-        fits.Column(name="TSUBINT", format="1D", unit="s", array=tsubint),
-        fits.Column(name="OFFS_SUB", format="1D", unit="s", array=offs_sub),
-        fits.Column(name="LST_SUB", format="1D", unit="s", array=lst_sub),
-        fits.Column(name="RA_SUB", format="1D", unit="deg", array=ra_sub),
-        fits.Column(name="DEC_SUB", format="1D", unit="deg", array=dec_sub),
-        fits.Column(name="GLON_SUB", format="1D", unit="deg", array=glon_sub),
-        fits.Column(name="GLAT_SUB", format="1D", unit="deg", array=glat_sub),
-        fits.Column(name="FD_ANG", format="1E", unit="deg", array=fd_ang),
-        fits.Column(name="POS_ANG", format="1E", unit="deg", array=pos_ang),
-        fits.Column(name="PAR_ANG", format="1E", unit="deg", array=par_ang),
-        fits.Column(name="TEL_AZ", format="1E", unit="deg", array=tel_az),
-        fits.Column(name="TEL_ZEN", format="1E", unit="deg", array=tel_zen),
-        fits.Column(name="DAT_FREQ", format=f"{nchans}E", unit="MHz", array=dat_freq),
-        fits.Column(name="DAT_WTS", format=f"{nchans}E", array=dat_wts),
-        fits.Column(name="DAT_OFFS", format=f"{nchans}E", array=dat_offs),
-        fits.Column(name="DAT_SCL", format=f"{nchans}E", array=dat_scl),
+    dtype = np.dtype(your_object.your_header.dtype)
+    data_format = {
+        np.dtype(np.uint8): "B",
+        np.dtype(np.int16): "I",
+        np.dtype(np.int32): "J",
+        np.dtype(np.int64): "K",
+        np.dtype(np.float32): "E",
+        np.dtype(np.float64): "D",
+    }.get(dtype, "E")
+    columns = [
+        fits.Column(name="TSUBINT", format="1D", unit="s"),
+        fits.Column(name="OFFS_SUB", format="1D", unit="s"),
+        fits.Column(name="LST_SUB", format="1D", unit="s"),
+        fits.Column(name="RA_SUB", format="1D", unit="deg"),
+        fits.Column(name="DEC_SUB", format="1D", unit="deg"),
+        fits.Column(name="GLON_SUB", format="1D", unit="deg"),
+        fits.Column(name="GLAT_SUB", format="1D", unit="deg"),
+        fits.Column(name="FD_ANG", format="1E", unit="deg"),
+        fits.Column(name="POS_ANG", format="1E", unit="deg"),
+        fits.Column(name="PAR_ANG", format="1E", unit="deg"),
+        fits.Column(name="TEL_AZ", format="1E", unit="deg"),
+        fits.Column(name="TEL_ZEN", format="1E", unit="deg"),
+        fits.Column(name="DAT_FREQ", format=f"{nchans}E", unit="MHz"),
+        fits.Column(name="DAT_WTS", format=f"{nchans}E"),
+        fits.Column(name="DAT_OFFS", format=f"{nchans}E"),
+        fits.Column(name="DAT_SCL", format=f"{nchans}E"),
         fits.Column(
             name="DATA",
-            format=str(nifs * nchans * n_per_subint) + data_format,
+            format=f"{nifs * nchans * n_per_subint}{data_format}",
             dim=f"({nchans}, {nifs}, {n_per_subint})",
-            array=data,
         ),
     ]
-
-    # Add the columns to the table
-    logging.info("Building the PSRFITS table")
-    table_hdu = fits.BinTableHDU(
-        fits.FITS_rec.from_columns(tbl_columns), name="subint", header=thdr
-    )
-
-    # Add primary header
+    table_hdu = fits.BinTableHDU.from_columns(columns, header=thdr, nrows=0)
+    table_hdu.header["EXTNAME"] = "SUBINT"
+    table_hdu.header["NAXIS2"] = n_subints
     primary_hdu = fits.PrimaryHDU(header=phdr)
+    primary_hdu.header["EXTEND"] = True
 
-    # Add hdus to FITS file and write
+    record_dtype = table_hdu.data.dtype.newbyteorder(">")
+
     logging.info(f"Writing PSRFITS table to file: {outfile}")
-    fits_data.append(primary_hdu)
-    fits_data.append(table_hdu)
-    fits_data.writeto(outfile, overwrite=True)
+    with open(outfile, "wb") as fits_file:
+        fits_file.write(
+            primary_hdu.header.tostring(sep="", endcard=True, padding=True).encode(
+                "ascii"
+            )
+        )
+        fits_file.write(
+            table_hdu.header.tostring(sep="", endcard=True, padding=True).encode(
+                "ascii"
+            )
+        )
+        for first_row in range(0, n_subints, chunk_rows):
+            rows = min(chunk_rows, n_subints - first_row)
+            records = np.zeros(rows, dtype=record_dtype)
+            offs_sub = (np.arange(first_row, first_row + rows) + 0.5) * t_subint
+            records["TSUBINT"] = t_subint
+            records["OFFS_SUB"] = offs_sub
+            records["LST_SUB"] = [
+                np.nan
+                if d.longitude is None
+                else d.calc_lst(mjd + offset / (24.0 * 3600.0), d.longitude)
+                for offset in offs_sub
+            ]
+            records["RA_SUB"] = ra_deg
+            records["DEC_SUB"] = dec_deg
+            records["GLON_SUB"] = l_deg
+            records["GLAT_SUB"] = b_deg
+            records["DAT_FREQ"] = chan_freqs
+            records["DAT_WTS"] = 1
+            records["DAT_SCL"] = 1
+
+            samples = min(rows * n_per_subint, nsamps - first_row * n_per_subint)
+            if data_reader is not None and samples:
+                data = data_reader(nstart + first_row * n_per_subint, samples)
+                if data.shape != (samples, nifs, nchans):
+                    raise ValueError(
+                        "data_reader returned data with shape "
+                        f"{data.shape}, expected {(samples, nifs, nchans)}"
+                    )
+                full_rows, tail = divmod(samples, n_per_subint)
+                if full_rows:
+                    records["DATA"][:full_rows] = data[
+                        : full_rows * n_per_subint
+                    ].reshape(full_rows, n_per_subint, nifs, nchans)
+                if tail:
+                    records["DATA"][full_rows, :tail] = data[full_rows * n_per_subint :]
+            records.tofile(fits_file)
+        padding = (-n_subints * record_dtype.itemsize) % 2880
+        if padding:
+            fits_file.write(b"\0" * padding)
     logging.info(f"Header information written in {outfile}")
-    return
