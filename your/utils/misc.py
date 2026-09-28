@@ -12,6 +12,31 @@ import os
 from skimage.transform import resize
 
 
+class ReadBuffer:
+    """
+    One host buffer, reused for every chunk put in it and grown when a chunk
+    is larger than any before it, so a worker making one candidate after
+    another does not allocate, fault in and zero a fresh array for each.
+
+    Each use overwrites the last, so what is in it is only good until the
+    next: meant for a worker that makes one candidate at a time.
+
+    Args:
+        granule (int): allocation size is rounded up to a multiple of this
+    """
+
+    def __init__(self, granule=64 * 2**20):
+        self.granule = granule
+        self.buffer = None
+
+    def __call__(self, nbytes):
+        if self.buffer is None or self.buffer.size < nbytes:
+            self.buffer = None
+            size = -(-nbytes // self.granule) * self.granule
+            self.buffer = np.empty(size, dtype=np.uint8)
+        return self.buffer
+
+
 def _decimate(data, decimate_factor, axis, pad=False, **kwargs):
     """
     Decimate an input array by an input factor. Optionally padding can also be done.
