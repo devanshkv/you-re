@@ -342,7 +342,9 @@ class Candidate(Your):
             )
             data[: nspectra - nstart_read, :] = d
 
-        self.data = data.astype(self.your_header.dtype)
+        # no copy when the data read already has the header's dtype, so a
+        # chunk read into a reused buffer stays there
+        self.data = data.astype(self.your_header.dtype, copy=False)
 
         if self.kill_mask.any():
             logger.info("Applying the kill mask")
