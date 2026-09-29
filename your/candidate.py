@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 from operator import index
 
 import h5py
@@ -8,6 +9,7 @@ from numba import njit, prange
 from scipy.optimize import golden
 
 from your import Your
+from your._rust import crop_planes as _rust_crop_planes
 from your._rust import dedisperse as _rust_dedisperse
 from your._rust import dedispersets as _rust_dedispersets
 from your._rust import dmtime as _rust_dmtime
@@ -25,7 +27,43 @@ _RUST_DEDISPERSETS_DTYPES = {
     np.dtype(np.float64),
 }
 
+_RUST_CROP_DTYPES = {
+    np.dtype(np.uint8),
+    np.dtype(np.uint16),
+    np.dtype(np.int16),
+    np.dtype(np.int32),
+}
+
 logger = logging.getLogger(__name__)
+
+
+def crop_window(nsamples, decimate_factor, time_size):
+    """
+    Which columns the candmaker keeps of a plane averaged over
+    `decimate_factor` samples by `decimate(..., pad=True)` and then cropped
+    to its middle `time_size` columns by `crop`.
+
+    Args:
+        nsamples (int): samples in the chunk
+        decimate_factor (int): samples averaged into each column
+        time_size (int): columns kept
+
+    Returns:
+        tuple: (first column, number of columns), or None where `crop` would
+        raise, or where a kept column would take in the median padding, which
+        needs the whole full-resolution row
+    """
+    ncols = -(-nsamples // decimate_factor)
+    col0 = ncols // 2 - time_size // 2
+    if ncols > col0 + time_size:
+        kept = time_size
+    elif ncols == time_size:
+        col0, kept = 0, ncols
+    else:
+        return None
+    if nsamples % decimate_factor and col0 + kept == ncols:
+        return None
+    return col0, kept
 
 
 @njit(parallel=True, cache=True)
@@ -580,6 +618,83 @@ class Candidate(Your):
                     self.data[:, ii], delay_bins[ii], start, stop
                 )
             return ts
+
+    def crop_planes(
+        self,
+        decimate_factor,
+        time_size=256,
+        dmsteps=256,
+        *,
+        upstream_rounding=False,
+        threads=None,
+    ):
+        """
+        The DM-time and frequency-time planes `dmtime` and `dedisperse` make,
+        averaged over `decimate_factor` samples and cropped to their middle
+        `time_size` columns as the candmaker does with `decimate(pad=True)`
+        and `crop`, computing only the columns kept, in one threaded pass.
+        Saves them in `self.dmt` and `self.dedispersed`.
+
+        Args:
+            decimate_factor (int): samples averaged into each column
+            time_size (int): columns kept, about the middle
+            dmsteps (int): Number of DMs to dedisperse at.
+            upstream_rounding (bool): exact integer sums through each
+                channel's running sum, divided once, when False; when True,
+                round as the full-array route does (float32 per sample, then
+                NumPy's float32 mean), matching it bit for bit where a
+                column's float32 sum passes 2**24, at the cost of summing
+                every sample
+            threads (int): threads to use; all cores when None
+
+        Returns:
+            tuple: (DM-time plane, frequency-time plane), or None, leaving
+            both alone, when the full-array route is needed: data other than
+            8-32 bit integers, or a crop that takes in the median padding.
+        """
+        if (
+            type(self.data) is not np.ndarray
+            or self.data.dtype not in _RUST_CROP_DTYPES
+            or self.data.ndim != 2
+        ):
+            return None
+        nt, nf = self.data.shape
+        window = crop_window(nt, decimate_factor, time_size)
+        if window is None:
+            return None
+        col0, kept = window
+
+        freqs = self.chan_freqs
+        assert nf == len(freqs)
+        frequency_term = 1 / freqs[0] ** 2 - 1 / freqs**2
+
+        def shifts(delays):
+            # delays of the whole chunk or more leave a channel where it is,
+            # as the full-array route's slices do
+            delays = delays.astype(np.int64)
+            return np.where(np.abs(delays) < nt, delays % nt, 0)
+
+        dm_list = self.dm + np.linspace(-self.dm, self.dm, dmsteps)
+        dmt_delays = np.round(
+            (4148808.0 * dm_list[:, None])
+            * frequency_term[None, :]
+            / 1000.0
+            / self.native_tsamp
+        )
+        ft_delays = np.round(
+            4148808.0 * self.dm * frequency_term / 1000 / self.native_tsamp
+        )
+        self.dmt, self.dedispersed = _rust_crop_planes(
+            np.ascontiguousarray(self.data),
+            np.ascontiguousarray(shifts(dmt_delays)),
+            shifts(ft_delays),
+            decimate_factor,
+            col0,
+            kept,
+            threads=threads or os.cpu_count() or 1,
+            upstream_rounding=upstream_rounding,
+        )
+        return self.dmt, self.dedispersed
 
     def dmtime(self, dmsteps=256, target="CPU", *, time_range=None):
         """

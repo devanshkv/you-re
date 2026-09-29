@@ -189,6 +189,129 @@ def public_checks(module, rfi):
                 raise AssertionError("float64 conversion did not raise")
 
 
+def crop_reference(obj, data, tdf, time_size, dmsteps):
+    """Exact DM-time and frequency-time crops from int64 sums, divided once."""
+    nt, nf = data.shape
+    freqs = obj.chan_freqs
+    term = 1 / freqs[0] ** 2 - 1 / freqs**2
+
+    def rolled(delays):
+        delays = np.round(delays).astype(np.int64)
+        return np.stack(
+            [
+                np.roll(data[:, ch].astype(np.int64), int(d))
+                if -nt < d < nt
+                else data[:, ch].astype(np.int64)
+                for ch, d in enumerate(delays)
+            ],
+            axis=1,
+        )
+
+    ncols = -(-nt // tdf)
+    col0 = ncols // 2 - time_size // 2
+    cols = slice(col0 * tdf, (col0 + time_size) * tdf)
+
+    def columns(x):
+        x = x[cols]
+        return x.reshape(time_size, tdf, *x.shape[1:]).sum(1) / tdf
+
+    dms = obj.dm + np.linspace(-obj.dm, obj.dm, dmsteps)
+    dmt = np.stack(
+        [columns(rolled((4148808.0 * dm) * term / 1000.0 / 0.001).sum(1)) for dm in dms]
+    )
+    ft = columns(rolled(4148808.0 * obj.dm * term / 1000 / 0.001))
+    return dmt.astype(np.float32), ft.astype(np.float32)
+
+
+def crop_checks(module):
+    """
+    crop_planes: with upstream rounding, bit for bit the dmtime/dedisperse
+    route decimated and cropped as the candmaker does; exact, the int64 sums.
+    """
+    from your.utils.misc import _decimate, crop
+
+    rng = np.random.default_rng(20260929)
+    # (dtype, nt, nf, dm, tdf, time_size): narrow and wide columns, delays
+    # past the chunk, and uint16 sums large enough for float32 to round
+    cases = [
+        (np.uint8, 512, 37, 7.0, 1, 256),
+        (np.uint8, 2000, 37, 30.0, 4, 256),
+        (np.uint16, 4096, 64, 7.0, 16, 128),
+        (np.uint16, 8192, 64, 2.0, 64, 64),
+        (np.int16, 3000, 29, 40.0, 8, 256),
+        (np.int32, 1500, 16, 7.0, 2, 256),
+    ]
+    rounded = False
+    for dtype, nt, nf, dm, tdf, time_size in cases:
+        info = np.iinfo(dtype)
+        low, high = (0, 256) if dtype == np.uint8 else (info.min // 2, info.max // 2)
+        if dtype == np.uint16:
+            low, high = info.max - 4096, info.max
+        data = rng.integers(low, int(high) + 1, (nt, nf)).astype(dtype)
+        obj = candidate(module, data)
+        obj.dm = dm
+        dmsteps = 16
+
+        full = candidate(module, data)
+        full.dm = dm
+        full.dmtime(dmsteps=dmsteps)
+        full.dedisperse()
+        dmt, ft = full.dmt, full.dedispersed
+        if tdf != 1:
+            dmt = _decimate(dmt, tdf, 1, pad=True, mode="median")
+            ft = _decimate(ft, tdf, 0, pad=True, mode="median")
+        dmt = crop(dmt, dmt.shape[1] // 2 - time_size // 2, time_size, 1)
+        ft = crop(ft, ft.shape[0] // 2 - time_size // 2, time_size, 0)
+        exact = crop_reference(obj, data, tdf, time_size, dmsteps)
+
+        before = data.copy()
+        for threads in (1, 3):
+            with patch.object(
+                module, "_rust_crop_planes", wraps=module._rust_crop_planes
+            ) as call:
+                got = obj.crop_planes(
+                    tdf, time_size, dmsteps, upstream_rounding=True, threads=threads
+                )
+                assert call.call_count == 1
+            same(got[0], dmt)
+            same(got[1], ft)
+            got = obj.crop_planes(
+                tdf, time_size, dmsteps, upstream_rounding=False, threads=threads
+            )
+            same(got[0], exact[0])
+            same(got[1], exact[1])
+        same(data, before)
+        rounded |= not np.array_equal(dmt, exact[0])
+    assert rounded, "no case exercised float32 rounding"
+
+    # the full-array route stays for padded crops and float data
+    data = (np.arange(1001 * 37) % 251).astype(np.uint8).reshape(1001, 37)
+    assert candidate(module, data).crop_planes(4, 251) is None  # takes in the pad
+    assert candidate(module, data.astype(np.float32)).crop_planes(4, 64) is None
+
+    native = module._rust_crop_planes
+    shifts = np.zeros((2, 37), np.int64)
+    for bad in (
+        dict(dmt_shifts=shifts + 1001),
+        dict(tdf=0),
+        dict(col0=250),
+    ):
+        kwargs = dict(
+            dmt_shifts=shifts,
+            ft_shifts=np.zeros(37, np.int64),
+            tdf=4,
+            col0=0,
+            ncols=250,
+        )
+        kwargs.update(bad)
+        try:
+            native(data, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"crop_planes accepted {bad}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--missing-rust", action="store_true")
@@ -216,13 +339,14 @@ def main():
 
     from your import _rust
 
-    for name in ("dedisperse", "dedispersets", "dmtime", "rfi_stats"):
+    for name in ("crop_planes", "dedisperse", "dedispersets", "dmtime", "rfi_stats"):
         assert callable(getattr(_rust, name))
     direct_checks(_rust)
     import your.candidate as module
     from your.utils import rfi
 
     public_checks(module, rfi)
+    crop_checks(module)
     print("PASS: native kernels and NumPy compatibility paths")
 
 

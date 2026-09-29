@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod crop;
 mod kernels;
 
 use kernels::{
@@ -367,8 +368,128 @@ fn dmtime<'py>(
     ))
 }
 
+fn crop_planes_array<'py, T: Element + crop::Sample>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, T>,
+    dmt_shifts: &PyReadonlyArray2<'py, i64>,
+    ft_shifts: &PyReadonlyArray1<'py, i64>,
+    geometry: (usize, usize, usize, usize),
+    upstream_rounding: bool,
+) -> PyResult<CropPlanes<'py>> {
+    let (tdf, col0, ncols, threads) = geometry;
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    if nt == 0 || nf == 0 {
+        return Err(PyValueError::new_err("data must not be empty"));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let dmt = dmt_shifts.as_array();
+    let dmsteps = dmt.shape()[0];
+    if dmt.shape()[1] != nf || ft_shifts.len() != nf {
+        return Err(PyValueError::new_err(format!(
+            "shifts must have {nf} channels"
+        )));
+    }
+    if tdf == 0 || ncols == 0 || (col0 + ncols).checked_mul(tdf).is_none_or(|end| end > nt) {
+        return Err(PyValueError::new_err(
+            "expected tdf >= 1, ncols >= 1 and (col0 + ncols) * tdf <= data length",
+        ));
+    }
+    let reduce = |shift: i64| -> PyResult<usize> {
+        usize::try_from(shift)
+            .ok()
+            .filter(|&s| s < nt)
+            .ok_or_else(|| PyValueError::new_err("shifts must lie in [0, data length)"))
+    };
+    let dmt_shifts: Vec<usize> = dmt.iter().map(|&s| reduce(s)).collect::<PyResult<_>>()?;
+    let ft_shifts: Vec<usize> = ft_shifts
+        .as_array()
+        .iter()
+        .map(|&s| reduce(s))
+        .collect::<PyResult<_>>()?;
+    let crop = crop::Crop {
+        nt,
+        nf,
+        dmt_shifts: &dmt_shifts,
+        dmsteps,
+        ft_shifts: &ft_shifts,
+        tdf,
+        col0,
+        ncols,
+        threads,
+    };
+    let (dmt_plane, ft_plane) = py.detach(|| {
+        if upstream_rounding {
+            crop::upstream(values, &crop)
+        } else {
+            crop::exact(values, &crop)
+        }
+    });
+    let dmt_plane = Array2::from_shape_vec((dmsteps, ncols), dmt_plane)
+        .map_err(|_| PyMemoryError::new_err("DM-time plane is too large"))?;
+    let ft_plane = Array2::from_shape_vec((ncols, nf), ft_plane)
+        .map_err(|_| PyMemoryError::new_err("frequency-time plane is too large"))?;
+    Ok((dmt_plane.into_pyarray(py), ft_plane.into_pyarray(py)))
+}
+
+type CropPlanes<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<f32>>);
+
+/// Decimated, cropped DM-time and frequency-time planes of integer data:
+/// `(dmt (dmsteps, ncols), ft (ncols, nchans))` float32, columns of `tdf`
+/// samples from column `col0`, each channel rolled by its shift (in
+/// [0, nt)). Exact integer sums divided once, or with `upstream_rounding`,
+/// the float32 rounding of the full-array dedisperse/dmtime/decimate route.
+#[pyfunction(signature = (data, dmt_shifts, ft_shifts, tdf, col0, ncols, threads=1, upstream_rounding=false))]
+#[allow(clippy::too_many_arguments)]
+fn crop_planes<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    dmt_shifts: PyReadonlyArray2<'py, i64>,
+    ft_shifts: PyReadonlyArray1<'py, i64>,
+    tdf: usize,
+    col0: usize,
+    ncols: usize,
+    threads: usize,
+    upstream_rounding: bool,
+) -> PyResult<CropPlanes<'py>> {
+    let data = data.cast::<PyUntypedArray>()?;
+    if data.ndim() != 2 {
+        return Err(PyValueError::new_err(
+            "data must be a two-dimensional array",
+        ));
+    }
+    let geometry = (tdf, col0, ncols, threads);
+    let type_num = data.dtype().num();
+    macro_rules! dispatch {
+        ($ty:ty) => {
+            return crop_planes_array(
+                py,
+                data.cast::<PyArray2<$ty>>()?.readonly(),
+                &dmt_shifts,
+                &ft_shifts,
+                geometry,
+                upstream_rounding,
+            )
+        };
+    }
+    if type_num == dtype::<u8>(py).num() {
+        dispatch!(u8);
+    } else if type_num == dtype::<u16>(py).num() {
+        dispatch!(u16);
+    } else if type_num == dtype::<i16>(py).num() {
+        dispatch!(i16);
+    } else if type_num == dtype::<i32>(py).num() {
+        dispatch!(i32);
+    }
+    Err(PyTypeError::new_err(
+        "data dtype is not supported by your._rust.crop_planes",
+    ))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(crop_planes, module)?)?;
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;
     module.add_function(wrap_pyfunction!(dmtime, module)?)?;

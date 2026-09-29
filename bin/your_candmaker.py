@@ -22,6 +22,8 @@ from multiprocessing.util import Finalize
 
 import numpy as np
 import pandas as pd
+from numba import config as numba_config
+from numba import set_num_threads
 
 from your.candidate import Candidate, crop
 from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop
@@ -45,6 +47,27 @@ def cpu_dedisp_dmt(cand, args):
     else:
         time_decimate_factor = pulse_width // 2
     logger.debug(f"Time decimation factor {time_decimate_factor}")
+
+    # both planes at their cropped size in one pass, where the data allow it
+    cropped = (
+        cand.crop_planes(
+            time_decimate_factor,
+            args.time_size,
+            upstream_rounding=args.upstream_rounding,
+            threads=worker_threads(args.nproc),
+        )
+        is not None
+    )
+    if cropped:
+        logger.info("Made DMT and dedispersed profile at their cropped size")
+        if args.opt_dm:
+            logger.info("Optimising DM")
+            logger.warning("This feature is experimental!")
+            cand.optimize_dm()
+        else:
+            cand.dm_opt = -1
+            cand.snr_opt = -1
+        return cand
 
     # Plan the same crop on the padded, decimated time axis. Only bypass full
     # arrays when every requested bin lies inside the unpadded shifted data.
@@ -108,6 +131,18 @@ def cpu_dedisp_dmt(cand, args):
         f"Decimated DM-Time to dmsize: {cand.dmt.shape[0]} and tsize: {cand.dmt.shape[1]}"
     )
     return cand
+
+
+def worker_threads(nproc):
+    """
+    Threads for one of `nproc` candmaker workers: an equal share of the cores
+    this process may run on, so the workers do not oversubscribe them.
+    """
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    return max(1, cores // nproc)
 
 
 def _input_files(filename, num_files):
@@ -177,6 +212,8 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         args,
         gpu_id,
     ) = cand_val
+    # the median's numba threads, an equal share of the cores per worker
+    set_num_threads(min(worker_threads(args.nproc), numba_config.NUMBA_NUM_THREADS))
     if os.path.exists(str(kill_mask_path)):
         logger.info(f"Using mask {kill_mask_path}")
         kill_chans = np.loadtxt(kill_mask_path, dtype=np.int32)
@@ -384,6 +421,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no_log_file", help="Do not write a log file", action="store_true"
+    )
+    parser.add_argument(
+        "--upstream_rounding",
+        help="On the CPU, round the DM-time plane in float32 as earlier versions "
+        "did, for bit-identical output, instead of summing it exactly (slower)",
+        action="store_true",
     )
     values = parser.parse_args()
 

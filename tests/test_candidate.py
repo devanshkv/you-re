@@ -282,3 +282,68 @@ def test_padded_chunk_read_into_place(cand_fil, where):
     cand_fil.get_chunk()
     np.testing.assert_array_equal(cand_fil.data, expected)
     assert np.shares_memory(cand_fil.data, buffer.buffer)
+
+
+@pytest.mark.parametrize("width", [1, 2, 8, 64])
+@pytest.mark.parametrize("upstream_rounding", [True, False])
+def test_crop_planes_match_the_full_route(cand_fil, width, upstream_rounding):
+    from your.utils.misc import _decimate, crop
+
+    cand_fil.width = width
+    cand_fil.get_chunk()
+    tdf = 1 if width < 3 else width // 2
+    time_size = -(-cand_fil.data.shape[0] // tdf) // 2
+    full = Candidate(
+        fp=cand_fil.your_file,
+        dm=cand_fil.dm,
+        tcand=cand_fil.tcand,
+        width=width,
+        label=-1,
+        snr=16.8128,
+        min_samp=256,
+        device=0,
+    )
+    full.data = cand_fil.data
+    full.dmtime()
+    full.dedisperse()
+    dmt, ft = full.dmt, full.dedispersed
+    if tdf != 1:
+        dmt = _decimate(dmt, tdf, 1, pad=True, mode="median")
+        ft = _decimate(ft, tdf, 0, pad=True, mode="median")
+    dmt = crop(dmt, dmt.shape[1] // 2 - time_size // 2, time_size, 1)
+    ft = crop(ft, ft.shape[0] // 2 - time_size // 2, time_size, 0)
+    got = cand_fil.crop_planes(
+        tdf, time_size, upstream_rounding=upstream_rounding, threads=2
+    )
+    # 8-bit sums stay below 2**24 here, so both ways are exact
+    np.testing.assert_array_equal(got[0], dmt)
+    np.testing.assert_array_equal(got[1], ft)
+    assert got[0] is cand_fil.dmt and got[1] is cand_fil.dedispersed
+
+
+def test_candmaker_cpu_path_matches_full_route(cand_fil, monkeypatch):
+    import argparse
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "your_candmaker",
+        os.path.join(os.path.dirname(__file__), "../bin/your_candmaker.py"),
+    )
+    candmaker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(candmaker)
+    cand_fil.width = 8
+    for upstream_rounding in (False, True):
+        args = argparse.Namespace(
+            time_size=64, opt_dm=False, upstream_rounding=upstream_rounding, nproc=2
+        )
+        cand_fil.get_chunk()
+        new = candmaker.cpu_dedisp_dmt(cand_fil, args)
+        planes = (new.dmt.copy(), new.dedispersed.copy())
+        with monkeypatch.context() as m:
+            m.setattr(Candidate, "crop_planes", lambda self, *a, **k: None)
+            cand_fil.get_chunk()
+            old = candmaker.cpu_dedisp_dmt(cand_fil, args)
+        np.testing.assert_array_equal(planes[0], old.dmt)
+        np.testing.assert_array_equal(planes[1], old.dedispersed)
+    assert candmaker.worker_threads(1) >= candmaker.worker_threads(4) >= 1
+    assert candmaker.worker_threads(10**6) == 1
