@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pytest
 
-from your.candidate import Candidate
+from your.candidate import Candidate, channel_median, pad_with_median
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 _install_dir = os.path.abspath(os.path.dirname(__file__))
@@ -233,3 +233,52 @@ def test_kill_mask():
     assert cand.data[:, cand.kill_mask].sum() == 0
     assert cand.data[:, [10, 12, 300]].sum() == 0
     assert cand.data[:, ~cand.kill_mask].sum() != 0
+
+
+@pytest.mark.parametrize("nsamples", [1, 2, 7, 1000, 4097, 8192])
+@pytest.mark.parametrize("nchans", [1, 64, 100, 336])
+def test_channel_median_matches_numpy(nsamples, nchans):
+    rng = np.random.default_rng(nsamples)
+    data = rng.integers(0, 256, (nsamples, nchans), dtype=np.uint8)
+    data[:, 0] = 255
+    if nchans > 1:
+        data[:, 1] = rng.integers(3, 5, nsamples)
+    np.testing.assert_array_equal(channel_median(data), np.median(data, axis=0))
+    # a strided view, as a padded read can be
+    np.testing.assert_array_equal(
+        channel_median(data[::2, ::-1]), np.median(data[::2, ::-1], axis=0)
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32])
+@pytest.mark.parametrize("row0, rows", [(5, 20), (0, 20), (5, 35)])
+def test_pad_with_median_matches_ones_times_median(dtype, row0, rows):
+    rng = np.random.default_rng(0)
+    d = rng.integers(0, 200, (rows, 16)).astype(dtype)
+    old = np.ones((40, 16), dtype=dtype) * np.median(d, axis=0)[None, :]
+    old[row0 : row0 + rows] = d
+    new = pad_with_median(d, 40, row0, dtype)
+    assert new.dtype == dtype
+    np.testing.assert_array_equal(new, old.astype(dtype))
+
+
+@pytest.mark.parametrize("where", ["start", "end", "both"])
+def test_padded_chunk_read_into_place(cand_fil, where):
+    from your.utils.misc import ReadBuffer
+
+    length = cand_fil.your_header.nspectra * cand_fil.native_tsamp
+    if where == "start":
+        cand_fil.tcand = 0.05
+    elif where == "end":
+        cand_fil.tcand = length - 0.05
+    else:
+        cand_fil.dm *= 20  # a chunk longer than the file
+    cand_fil.get_chunk()
+    expected = cand_fil.data.copy()
+    assert expected.shape[0] > cand_fil.your_header.nspectra or where != "both"
+
+    buffer = ReadBuffer(granule=4096)
+    cand_fil.read_buffer = buffer
+    cand_fil.get_chunk()
+    np.testing.assert_array_equal(cand_fil.data, expected)
+    assert np.shares_memory(cand_fil.data, buffer.buffer)

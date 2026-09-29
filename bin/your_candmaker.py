@@ -24,14 +24,18 @@ import numpy as np
 import pandas as pd
 
 from your.candidate import Candidate, crop
-from your.utils.gpu import gpu_dedisp_and_dmt_crop
-from your.utils.misc import YourArgparseFormatter
+from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop
+from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
 logger = logging.getLogger()
 
 _worker_candidate = None
 _worker_candidate_key = None
 _worker_candidate_finalizer = None
+# this process's page-locked read buffer, made on its first GPU candidate
+_read_buffer = None
+# this process's reused read buffer for the CPU path
+_cpu_read_buffer = None
 
 
 def cpu_dedisp_dmt(cand, args):
@@ -203,6 +207,21 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         kill_mask = np.zeros(cand.nchans, dtype=np.bool_)
         kill_mask[kill_chans] = True
         cand.kill_mask = kill_mask
+    if gpu_id >= 0:
+        # this worker makes one candidate at a time, so every chunk can be
+        # read into the same page-locked buffer and uploaded from there, to
+        # whichever GPU the candidate goes to
+        global _read_buffer
+        if _read_buffer is None:
+            _read_buffer = PinnedReadBuffer(gpu_id)
+        cand.read_buffer = _read_buffer
+    else:
+        # likewise one ordinary buffer, so each chunk is not a fresh
+        # allocation the kernel has to fault in and zero
+        global _cpu_read_buffer
+        if _cpu_read_buffer is None:
+            _cpu_read_buffer = ReadBuffer()
+        cand.read_buffer = _cpu_read_buffer
     cand.get_chunk(for_preprocessing=True)
     if cand.format == "fil":
         cand.fp.close()
