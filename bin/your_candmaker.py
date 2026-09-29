@@ -22,16 +22,22 @@ from multiprocessing.util import Finalize
 
 import numpy as np
 import pandas as pd
+from numba import config as numba_config
+from numba import set_num_threads
 
 from your.candidate import Candidate, crop
-from your.utils.gpu import gpu_dedisp_and_dmt_crop
-from your.utils.misc import YourArgparseFormatter
+from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop
+from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
 logger = logging.getLogger()
 
 _worker_candidate = None
 _worker_candidate_key = None
 _worker_candidate_finalizer = None
+# this process's page-locked read buffer, made on its first GPU candidate
+_read_buffer = None
+# this process's reused read buffer for the CPU path
+_cpu_read_buffer = None
 
 
 def cpu_dedisp_dmt(cand, args):
@@ -41,6 +47,27 @@ def cpu_dedisp_dmt(cand, args):
     else:
         time_decimate_factor = pulse_width // 2
     logger.debug(f"Time decimation factor {time_decimate_factor}")
+
+    # both planes at their cropped size in one pass, where the data allow it
+    cropped = (
+        cand.crop_planes(
+            time_decimate_factor,
+            args.time_size,
+            upstream_rounding=args.upstream_rounding,
+            threads=worker_threads(args.nproc),
+        )
+        is not None
+    )
+    if cropped:
+        logger.info("Made DMT and dedispersed profile at their cropped size")
+        if args.opt_dm:
+            logger.info("Optimising DM")
+            logger.warning("This feature is experimental!")
+            cand.optimize_dm()
+        else:
+            cand.dm_opt = -1
+            cand.snr_opt = -1
+        return cand
 
     # Plan the same crop on the padded, decimated time axis. Only bypass full
     # arrays when every requested bin lies inside the unpadded shifted data.
@@ -104,6 +131,18 @@ def cpu_dedisp_dmt(cand, args):
         f"Decimated DM-Time to dmsize: {cand.dmt.shape[0]} and tsize: {cand.dmt.shape[1]}"
     )
     return cand
+
+
+def worker_threads(nproc):
+    """
+    Threads for one of `nproc` candmaker workers: an equal share of the cores
+    this process may run on, so the workers do not oversubscribe them.
+    """
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    return max(1, cores // nproc)
 
 
 def _input_files(filename, num_files):
@@ -173,6 +212,8 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         args,
         gpu_id,
     ) = cand_val
+    # the median's numba threads, an equal share of the cores per worker
+    set_num_threads(min(worker_threads(args.nproc), numba_config.NUMBA_NUM_THREADS))
     if os.path.exists(str(kill_mask_path)):
         logger.info(f"Using mask {kill_mask_path}")
         kill_chans = np.loadtxt(kill_mask_path, dtype=np.int32)
@@ -203,6 +244,21 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         kill_mask = np.zeros(cand.nchans, dtype=np.bool_)
         kill_mask[kill_chans] = True
         cand.kill_mask = kill_mask
+    if gpu_id >= 0:
+        # this worker makes one candidate at a time, so every chunk can be
+        # read into the same page-locked buffer and uploaded from there, to
+        # whichever GPU the candidate goes to
+        global _read_buffer
+        if _read_buffer is None:
+            _read_buffer = PinnedReadBuffer(gpu_id)
+        cand.read_buffer = _read_buffer
+    else:
+        # likewise one ordinary buffer, so each chunk is not a fresh
+        # allocation the kernel has to fault in and zero
+        global _cpu_read_buffer
+        if _cpu_read_buffer is None:
+            _cpu_read_buffer = ReadBuffer()
+        cand.read_buffer = _cpu_read_buffer
     cand.get_chunk(for_preprocessing=True)
     if cand.format == "fil":
         cand.fp.close()
@@ -365,6 +421,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no_log_file", help="Do not write a log file", action="store_true"
+    )
+    parser.add_argument(
+        "--upstream_rounding",
+        help="On the CPU, round the DM-time plane in float32 as earlier versions "
+        "did, for bit-identical output, instead of summing it exactly (slower)",
+        action="store_true",
     )
     values = parser.parse_args()
 

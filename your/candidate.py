@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import os
 from operator import index
 
 import h5py
 import numpy as np
+from numba import njit, prange
 from scipy.optimize import golden
 
 from your import Your
+from your._rust import crop_planes as _rust_crop_planes
 from your._rust import dedisperse as _rust_dedisperse
 from your._rust import dedispersets as _rust_dedispersets
 from your._rust import dmtime as _rust_dmtime
@@ -24,7 +27,132 @@ _RUST_DEDISPERSETS_DTYPES = {
     np.dtype(np.float64),
 }
 
+_RUST_CROP_DTYPES = {
+    np.dtype(np.uint8),
+    np.dtype(np.uint16),
+    np.dtype(np.int16),
+    np.dtype(np.int32),
+}
+
 logger = logging.getLogger(__name__)
+
+
+def crop_window(nsamples, decimate_factor, time_size):
+    """
+    Which columns the candmaker keeps of a plane averaged over
+    `decimate_factor` samples by `decimate(..., pad=True)` and then cropped
+    to its middle `time_size` columns by `crop`.
+
+    Args:
+        nsamples (int): samples in the chunk
+        decimate_factor (int): samples averaged into each column
+        time_size (int): columns kept
+
+    Returns:
+        tuple: (first column, number of columns), or None where `crop` would
+        raise, or where a kept column would take in the median padding, which
+        needs the whole full-resolution row
+    """
+    ncols = -(-nsamples // decimate_factor)
+    col0 = ncols // 2 - time_size // 2
+    if ncols > col0 + time_size:
+        kept = time_size
+    elif ncols == time_size:
+        col0, kept = 0, ncols
+    else:
+        return None
+    if nsamples % decimate_factor and col0 + kept == ncols:
+        return None
+    return col0, kept
+
+
+@njit(parallel=True, cache=True)
+def _channel_histogram(data, counts):
+    """
+    Count each 8-bit value in each channel: `counts[ch, v]` is how many
+    samples of channel `ch` are `v`. Threads take a band of 256 channels
+    each, reading whole cache lines of the chunk, and count into a private
+    32-bit table small enough to stay in cache before storing it.
+    """
+    nsamples, nchans = data.shape
+    for band in prange((nchans + 255) // 256):
+        c0 = band * 256
+        c1 = min(c0 + 256, nchans)
+        local = np.zeros((c1 - c0, 256), dtype=np.uint32)
+        for s in range(nsamples):
+            for ch in range(c0, c1):
+                local[ch - c0, data[s, ch]] += 1
+        for ch in range(c0, c1):
+            for v in range(256):
+                counts[ch, v] = local[ch - c0, v]
+
+
+def channel_median(data):
+    """
+    `np.median(data, axis=0)`, from per-channel value counts for 8-bit data:
+    the same middle order statistics, and for an even count the same float64
+    mean of the two, without partitioning every channel of a large chunk.
+
+    Args:
+        data (numpy.ndarray): (nsamples, nchans) data
+
+    Returns:
+        numpy.ndarray: (nchans,) float64 median of each channel
+    """
+    if data.dtype != np.uint8 or data.ndim != 2 or data.shape[0] == 0:
+        return np.median(data, axis=0)
+    nsamples, nchans = data.shape
+    counts = np.zeros((nchans, 256), dtype=np.int64)
+    _channel_histogram(data, counts)
+    below = np.cumsum(counts, axis=1)
+
+    def order_statistic(k):
+        # the smallest value with more than k samples at or below it
+        return (below <= k).sum(axis=1)
+
+    hi = order_statistic(nsamples // 2)
+    if nsamples % 2:
+        return hi.astype(np.float64)
+    lo = order_statistic(nsamples // 2 - 1)
+    return (lo.astype(np.float64) + hi) / 2
+
+
+def median_fill(data, dtype):
+    """
+    Each channel's median cast to `dtype`, as multiplying a ones array by the
+    median and casting back did: the value padding takes.
+
+    Args:
+        data (numpy.ndarray): (rows, nchans) data read
+        dtype: dtype of the padded chunk
+
+    Returns:
+        numpy.ndarray: (1, nchans) fill row
+    """
+    return (np.ones((1, data.shape[1]), dtype=dtype) * channel_median(data)).astype(
+        dtype
+    )
+
+
+def pad_with_median(data, nsamples, row0, dtype):
+    """
+    Place `data` at `row0` of `nsamples` rows, the rest filled with each
+    channel's median cast to `dtype`, as multiplying a ones array by the
+    median and casting back did, without the float64 copy of the chunk.
+
+    Args:
+        data (numpy.ndarray): (rows, nchans) data read
+        nsamples (int): rows of the padded chunk
+        row0 (int): row the data starts at
+        dtype: dtype of the padded chunk
+
+    Returns:
+        numpy.ndarray: (nsamples, nchans) padded chunk
+    """
+    out = np.empty((nsamples, data.shape[1]), dtype=dtype)
+    out[:] = median_fill(data, dtype)
+    out[row0 : row0 + data.shape[0]] = data
+    return out
 
 
 def _time_bounds(nt, time_range):
@@ -300,49 +428,27 @@ class Candidate(Your):
                     f"+nsamp_read({nsamp_read})<=nspectra({nspectra})"
                 )
                 logging.info("Padding with median in the beginning")
-                d = self.get_data(nstart=0, nsamp=nsamp_read + nstart_read)
-                dmedian = np.median(d, axis=0)
-                data = (
-                    np.ones(
-                        (nsamp_read, self.your_header.nchans),
-                        dtype=self.your_header.dtype,
-                    )
-                    * dmedian[None, :]
+                data = self._read_padded(
+                    nsamp_read, -nstart_read, 0, nsamp_read + nstart_read
                 )
-                data[-nstart_read:, :] = d
             else:
                 logging.debug(
                     f"nstart_read({nstart_read})<0 and nstart_read({nstart_read})"
                     f"+nsamp_read({nsamp_read})>nspectra({nspectra})"
                 )
                 logging.info("Padding with median in the beginning and the end")
-                d = self.get_data(nstart=0, nsamp=nspectra)
-                dmedian = np.median(d, axis=0)
-                data = (
-                    np.ones(
-                        (nsamp_read, self.your_header.nchans),
-                        dtype=self.your_header.dtype,
-                    )
-                    * dmedian[None, :]
-                )
-                data[-nstart_read : -nstart_read + nspectra, :] = d
+                data = self._read_padded(nsamp_read, -nstart_read, 0, nspectra)
         else:
             logging.debug(
                 f"nstart_read({nstart_read})>=0 and nstart_read({nstart_read})"
                 f"+nsamp_read({nsamp_read})>nspectra({nspectra})"
             )
             logging.info("Padding with median in the end")
-            d = self.get_data(nstart=nstart_read, nsamp=nspectra - nstart_read)
-            dmedian = np.median(d, axis=0)
-            data = (
-                np.ones(
-                    (nsamp_read, self.your_header.nchans), dtype=self.your_header.dtype
-                )
-                * dmedian[None, :]
-            )
-            data[: nspectra - nstart_read, :] = d
+            data = self._read_padded(nsamp_read, 0, nstart_read, nspectra - nstart_read)
 
-        self.data = data.astype(self.your_header.dtype)
+        # no copy when the data read already has the header's dtype, so a
+        # chunk read into a reused buffer stays there
+        self.data = data.astype(self.your_header.dtype, copy=False)
 
         if self.kill_mask.any():
             logger.info("Applying the kill mask")
@@ -363,6 +469,58 @@ class Candidate(Your):
             self.rfi_mask = mask
             np.copyto(self.data, 0, where=self.rfi_mask[None, :])
         return self
+
+    def _read_padded(self, nsamples, row0, nstart, nsamp):
+        """
+        `get_data(nstart, nsamp)` placed at row `row0` of `nsamples` rows, the
+        rest each channel's median, as `pad_with_median` makes it. With a
+        `read_buffer`, the samples are read straight into their place in it
+        and only the padding is written, instead of copying the read into a
+        new padded array; readers that do not fill the buffer in place get
+        `pad_with_median`.
+
+        Args:
+            nsamples (int): rows of the padded chunk
+            row0 (int): row the samples read start at
+            nstart (int): first sample to read
+            nsamp (int): samples to read
+
+        Returns:
+            numpy.ndarray: (nsamples, nchans) padded chunk
+        """
+        dtype = self.your_header.dtype
+        read_buffer = getattr(self, "read_buffer", None)
+        if read_buffer is None:
+            return pad_with_median(
+                self.get_data(nstart=nstart, nsamp=nsamp), nsamples, row0, dtype
+            )
+        rowbytes = self.your_header.nchans * np.dtype(dtype).itemsize
+        full = read_buffer(nsamples * rowbytes)
+        offset = row0 * rowbytes
+
+        def in_place(nbytes):
+            if offset + nbytes <= full.size:
+                return full[offset : offset + nbytes]
+            return np.empty(nbytes, dtype=np.uint8)
+
+        self.read_buffer = in_place
+        try:
+            d = self.get_data(nstart=nstart, nsamp=nsamp)
+        finally:
+            self.read_buffer = read_buffer
+        out = full[: nsamples * rowbytes].view(dtype).reshape(nsamples, -1)
+        placed = out[row0 : row0 + nsamp]
+        if (
+            d.dtype != dtype
+            or d.shape != placed.shape
+            or not d.flags.c_contiguous
+            or d.__array_interface__["data"][0] != placed.__array_interface__["data"][0]
+        ):
+            return pad_with_median(d, nsamples, row0, dtype)
+        fill = median_fill(d, dtype)
+        out[:row0] = fill
+        out[row0 + nsamp :] = fill
+        return out
 
     def dedisperse(self, dms=None, target="CPU", *, time_range=None):
         """
@@ -460,6 +618,83 @@ class Candidate(Your):
                     self.data[:, ii], delay_bins[ii], start, stop
                 )
             return ts
+
+    def crop_planes(
+        self,
+        decimate_factor,
+        time_size=256,
+        dmsteps=256,
+        *,
+        upstream_rounding=False,
+        threads=None,
+    ):
+        """
+        The DM-time and frequency-time planes `dmtime` and `dedisperse` make,
+        averaged over `decimate_factor` samples and cropped to their middle
+        `time_size` columns as the candmaker does with `decimate(pad=True)`
+        and `crop`, computing only the columns kept, in one threaded pass.
+        Saves them in `self.dmt` and `self.dedispersed`.
+
+        Args:
+            decimate_factor (int): samples averaged into each column
+            time_size (int): columns kept, about the middle
+            dmsteps (int): Number of DMs to dedisperse at.
+            upstream_rounding (bool): exact integer sums through each
+                channel's running sum, divided once, when False; when True,
+                round as the full-array route does (float32 per sample, then
+                NumPy's float32 mean), matching it bit for bit where a
+                column's float32 sum passes 2**24, at the cost of summing
+                every sample
+            threads (int): threads to use; all cores when None
+
+        Returns:
+            tuple: (DM-time plane, frequency-time plane), or None, leaving
+            both alone, when the full-array route is needed: data other than
+            8-32 bit integers, or a crop that takes in the median padding.
+        """
+        if (
+            type(self.data) is not np.ndarray
+            or self.data.dtype not in _RUST_CROP_DTYPES
+            or self.data.ndim != 2
+        ):
+            return None
+        nt, nf = self.data.shape
+        window = crop_window(nt, decimate_factor, time_size)
+        if window is None:
+            return None
+        col0, kept = window
+
+        freqs = self.chan_freqs
+        assert nf == len(freqs)
+        frequency_term = 1 / freqs[0] ** 2 - 1 / freqs**2
+
+        def shifts(delays):
+            # delays of the whole chunk or more leave a channel where it is,
+            # as the full-array route's slices do
+            delays = delays.astype(np.int64)
+            return np.where(np.abs(delays) < nt, delays % nt, 0)
+
+        dm_list = self.dm + np.linspace(-self.dm, self.dm, dmsteps)
+        dmt_delays = np.round(
+            (4148808.0 * dm_list[:, None])
+            * frequency_term[None, :]
+            / 1000.0
+            / self.native_tsamp
+        )
+        ft_delays = np.round(
+            4148808.0 * self.dm * frequency_term / 1000 / self.native_tsamp
+        )
+        self.dmt, self.dedispersed = _rust_crop_planes(
+            np.ascontiguousarray(self.data),
+            np.ascontiguousarray(shifts(dmt_delays)),
+            shifts(ft_delays),
+            decimate_factor,
+            col0,
+            kept,
+            threads=threads or os.cpu_count() or 1,
+            upstream_rounding=upstream_rounding,
+        )
+        return self.dmt, self.dedispersed
 
     def dmtime(self, dmsteps=256, target="CPU", *, time_range=None):
         """

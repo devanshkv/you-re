@@ -51,3 +51,15 @@ def test_myencoder():
 
     assert os.path.isfile("test.json")
     os.remove("test.json")
+
+
+def test_read_buffer_reused_and_grown():
+    from your.utils.misc import ReadBuffer
+
+    buffer = ReadBuffer(granule=1024)
+    first = buffer(100)
+    assert first.dtype == np.uint8 and first.size == 1024
+    assert buffer(1024) is first
+    grown = buffer(1025)
+    assert grown.size == 2048 and grown is not first
+    assert buffer(10) is grown
