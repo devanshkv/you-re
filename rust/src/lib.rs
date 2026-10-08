@@ -2,6 +2,7 @@
 
 mod crop;
 mod kernels;
+mod resize;
 
 use kernels::{
     fill_dedisperse, fill_dedispersed, fill_dmtime_packed, fill_rfi_stats, numpy_i64, ToF32,
@@ -487,12 +488,50 @@ fn crop_planes<'py>(
     ))
 }
 
+/// skimage's `resize(data, (nt, nf // factor), anti_aliasing=True,
+/// mode="constant")` of float32 rows before its clip: the Gaussian with the
+/// half kernel `weights` (centre first) at the filtered columns the linear
+/// interpolation reads, rounded as SciPy rounds them.
+#[pyfunction]
+fn gaussian_decimate<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray1<'py, f64>,
+    factor: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    if factor == 0 || nf == 0 || nf % factor != 0 {
+        return Err(PyValueError::new_err(
+            "expected factor >= 1 dividing a non-zero number of columns",
+        ));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let weights = weights
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("weights must be contiguous"))?;
+    if weights.is_empty() {
+        return Err(PyValueError::new_err("weights must not be empty"));
+    }
+    let size = nf / factor;
+    let mut out = Vec::new();
+    out.try_reserve_exact(nt * size)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))?;
+    out.resize(nt * size, 0.0_f32);
+    py.detach(|| resize::gaussian_decimate(values, nf, weights, factor, &mut out));
+    Array2::from_shape_vec((nt, size), out)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))
+        .map(|out| out.into_pyarray(py))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(crop_planes, module)?)?;
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;
     module.add_function(wrap_pyfunction!(dmtime, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_decimate, module)?)?;
     module.add_function(wrap_pyfunction!(rfi_stats, module)?)?;
     Ok(())
 }
