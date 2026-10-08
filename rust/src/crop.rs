@@ -54,6 +54,8 @@ const TILE: usize = 64;
 // samples by DMs of float32 rows summed at a time with upstream rounding
 const BLOCK_SAMPLES: usize = 4096;
 const DM_TILE: usize = 8;
+// channels whose boundary tables are added to a DM row before the next row
+const CHANNEL_BLOCK: usize = 8;
 
 /// `(nf, nt)` channel-major copy of `(nt, nf)` data, `threads` bands at a time.
 fn channel_major<T: Sample>(data: &[T], nt: usize, nf: usize, threads: usize) -> Vec<T> {
@@ -113,19 +115,24 @@ fn running_sum<T: Sample>(row: &[T], prefix: &mut [i64]) {
     }
 }
 
-/// Add to `dest[j]` a channel's running sum at `lo + j * tdf`, counting on
-/// past the chunk end as though it repeated: `dest[j + 1] - dest[j]` is then
-/// its sum over the `tdf` samples from `lo + j * tdf`, wrapped. Summed over
-/// channels the differences telescope, one read per channel and column.
-fn add_boundaries(prefix: &[i64], lo: usize, tdf: usize, dest: &mut [i64]) {
+/// A channel's running sum at every `r + m * tdf`, counting on past the chunk
+/// end as though it repeated, laid out by residue: `table[r * row_len + m]`.
+/// The boundaries `lo + j * tdf` of the columns from any `lo` are then the
+/// contiguous run from `(lo % tdf) * row_len + lo / tdf`, so adding them to
+/// a DM row is a plain vector add however far apart they are in time.
+fn boundary_table(prefix: &[i64], tdf: usize, row_len: usize, table: &mut [i64]) {
     let nt = prefix.len() - 1;
     let total = prefix[nt];
-    let before = dest.len().min((nt - lo) / tdf + 1);
-    for (j, d) in dest[..before].iter_mut().enumerate() {
-        *d += prefix[lo + j * tdf];
-    }
-    for (j, d) in dest.iter_mut().enumerate().skip(before) {
-        *d += prefix[lo + j * tdf - nt] + total;
+    for (r, row) in table.chunks_exact_mut(row_len).enumerate() {
+        let (mut x, mut base) = (r, 0_i64);
+        for value in row.iter_mut() {
+            *value = base + prefix[x];
+            x += tdf;
+            while x > nt {
+                x -= nt;
+                base += total;
+            }
+        }
     }
 }
 
@@ -156,10 +163,14 @@ fn start(crop: &Crop<'_>, shift: usize) -> usize {
 
 /// Exact planes: `(dmt, ft)`, `(dmsteps, ncols)` and `(ncols, nf)` float32.
 pub(crate) fn exact<T: Sample>(data: &[T], crop: &Crop<'_>) -> (Vec<f32>, Vec<f32>) {
-    let (nt, nf, ncols, dmsteps) = (crop.nt, crop.nf, crop.ncols, crop.dmsteps);
-    // each thread takes bands of channels, transposes one band at a time into
-    // its own buffer, and keeps one channel's running sum in cache while every
-    // DM step and the frequency-time column read it
+    let (nt, nf, ncols, dmsteps, tdf) = (crop.nt, crop.nf, crop.ncols, crop.dmsteps, crop.tdf);
+    // every `lo < nt` and its `ncols + 1` boundaries fall in a residue's row
+    let row_len = (nt - 1) / tdf + ncols + 1;
+    let table_len = tdf * row_len;
+    // each thread takes bands of channels and transposes one band at a time
+    // into its own buffer. A block of channels' boundary tables is then added
+    // to each DM row in turn, so a row stays in L1 for the whole block rather
+    // than the thread's DM-time plane passing through cache once per channel.
     let bands: Vec<usize> = (0..nf).step_by(BAND).collect();
     let threads = crop.threads.max(1).min(bands.len());
     let mut groups: Vec<Vec<usize>> = (0..threads).map(|_| Vec::new()).collect();
@@ -175,6 +186,7 @@ pub(crate) fn exact<T: Sample>(data: &[T], crop: &Crop<'_>) -> (Vec<f32>, Vec<f3
                     let mut ft = Vec::with_capacity(group.len());
                     let mut band = vec![data[0]; BAND * nt];
                     let mut prefix = vec![0_i64; nt + 1];
+                    let mut tables = vec![0_i64; CHANNEL_BLOCK * table_len];
                     for c0 in group {
                         let c1 = (c0 + BAND).min(nf);
                         for s0 in (0..nt).step_by(TILE) {
@@ -187,16 +199,27 @@ pub(crate) fn exact<T: Sample>(data: &[T], crop: &Crop<'_>) -> (Vec<f32>, Vec<f3
                             }
                         }
                         let mut ft_band = vec![0_i64; (c1 - c0) * ncols];
-                        for ch in c0..c1 {
-                            running_sum(&band[(ch - c0) * nt..(ch - c0 + 1) * nt], &mut prefix);
-                            for kk in 0..dmsteps {
-                                let lo = start(crop, crop.dmt_shifts[kk * nf + ch]);
-                                let dest = &mut dmt[kk * (ncols + 1)..(kk + 1) * (ncols + 1)];
-                                add_boundaries(&prefix, lo, crop.tdf, dest);
+                        for g0 in (c0..c1).step_by(CHANNEL_BLOCK) {
+                            let g1 = (g0 + CHANNEL_BLOCK).min(c1);
+                            for ch in g0..g1 {
+                                running_sum(&band[(ch - c0) * nt..(ch - c0 + 1) * nt], &mut prefix);
+                                let table = &mut tables[(ch - g0) * table_len..][..table_len];
+                                boundary_table(&prefix, tdf, row_len, table);
+                                let lo = start(crop, crop.ft_shifts[ch]);
+                                let dest = &mut ft_band[(ch - c0) * ncols..(ch - c0 + 1) * ncols];
+                                add_runs(&prefix, lo, tdf, dest);
                             }
-                            let lo = start(crop, crop.ft_shifts[ch]);
-                            let dest = &mut ft_band[(ch - c0) * ncols..(ch - c0 + 1) * ncols];
-                            add_runs(&prefix, lo, crop.tdf, dest);
+                            for (kk, dest) in dmt.chunks_exact_mut(ncols + 1).enumerate() {
+                                let shifts = &crop.dmt_shifts[kk * nf..(kk + 1) * nf];
+                                for (ch, table) in (g0..g1).zip(tables.chunks_exact(table_len)) {
+                                    let lo = start(crop, shifts[ch]);
+                                    let run =
+                                        &table[(lo % tdf) * row_len + lo / tdf..][..ncols + 1];
+                                    for (d, &v) in dest.iter_mut().zip(run) {
+                                        *d += v;
+                                    }
+                                }
+                            }
                         }
                         ft.push((c0, ft_band));
                     }
@@ -437,6 +460,37 @@ mod tests {
                 (&upstream.0, &dmt),
                 (&upstream.1, &ft),
             ] {
+                for (g, w) in got.iter().zip(want) {
+                    assert_eq!(*g, *w as f32, "tdf {tdf} col0 {col0} ncols {ncols}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_matches_across_channel_blocks_and_bands() {
+        // two full bands and a partial one, whose last channel block is partial
+        let (nt, nf, dmsteps) = (41, 2 * BAND + CHANNEL_BLOCK + 3, 4);
+        let data: Vec<u8> = (0..nt * nf).map(|i| (i * 89 % 253) as u8).collect();
+        let dmt_shifts: Vec<usize> = (0..dmsteps * nf).map(|i| (i * 13 + i / nf) % nt).collect();
+        let ft_shifts: Vec<usize> = (0..nf).map(|i| (i * 5 + 17) % nt).collect();
+        for (tdf, col0, ncols, threads) in
+            [(1, 3, 38, 2), (3, 1, 12, 3), (8, 0, 5, 1), (10, 1, 3, 4)]
+        {
+            let crop = Crop {
+                nt,
+                nf,
+                dmt_shifts: &dmt_shifts,
+                dmsteps,
+                ft_shifts: &ft_shifts,
+                tdf,
+                col0,
+                ncols,
+                threads,
+            };
+            let (dmt, ft) = reference(&data, &crop);
+            let (got_dmt, got_ft) = exact(&data, &crop);
+            for (got, want) in [(&got_dmt, &dmt), (&got_ft, &ft)] {
                 for (g, w) in got.iter().zip(want) {
                     assert_eq!(*g, *w as f32, "tdf {tdf} col0 {col0} ncols {ncols}");
                 }
