@@ -290,15 +290,16 @@ def crop_checks(module):
     assert candidate(module, data.astype(np.float32)).crop_planes(4, 64) is None
 
     native = module._rust_crop_planes
-    shifts = np.zeros((2, 37), np.int64)
     for bad in (
-        dict(dmt_shifts=shifts + 1001),
+        dict(frequency_term=np.zeros(36)),
         dict(tdf=0),
         dict(col0=250),
     ):
         kwargs = dict(
-            dmt_shifts=shifts,
-            ft_shifts=np.zeros(37, np.int64),
+            kdms=np.zeros(2),
+            ft_kdm=0.0,
+            frequency_term=np.zeros(37),
+            tsamp=0.001,
             tdf=4,
             col0=0,
             ncols=250,

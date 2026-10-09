@@ -667,27 +667,23 @@ class Candidate(Your):
         freqs = self.chan_freqs
         assert nf == len(freqs)
         frequency_term = 1 / freqs[0] ** 2 - 1 / freqs**2
-
-        def shifts(delays):
-            # delays of the whole chunk or more leave a channel where it is,
-            # as the full-array route's slices do
-            delays = delays.astype(np.int64)
-            return np.where(np.abs(delays) < nt, delays % nt, 0)
-
         dm_list = self.dm + np.linspace(-self.dm, self.dm, dmsteps)
-        dmt_delays = np.round(
-            (4148808.0 * dm_list[:, None])
-            * frequency_term[None, :]
-            / 1000.0
-            / self.native_tsamp
-        )
-        ft_delays = np.round(
-            4148808.0 * self.dm * frequency_term / 1000 / self.native_tsamp
-        )
+        # the delays are `kdm * frequency_term / 1000 / tsamp`, rounded, and
+        # each channel's shift made from its delay in Rust exactly as NumPy
+        # would, which holds while that arithmetic is all float64
+        kdms = 4148808.0 * dm_list
+        ft_kdm = 4148808.0 * self.dm
+        if not all(
+            np.result_type(k, frequency_term, self.native_tsamp) == np.float64
+            for k in (kdms, ft_kdm)
+        ):
+            return None
         self.dmt, self.dedispersed = _rust_crop_planes(
             np.ascontiguousarray(self.data),
-            np.ascontiguousarray(shifts(dmt_delays)),
-            shifts(ft_delays),
+            np.ascontiguousarray(kdms, dtype=np.float64),
+            float(ft_kdm),
+            np.ascontiguousarray(frequency_term, dtype=np.float64),
+            float(self.native_tsamp),
             decimate_factor,
             col0,
             kept,

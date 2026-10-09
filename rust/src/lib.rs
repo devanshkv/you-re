@@ -372,11 +372,11 @@ fn dmtime<'py>(
 fn crop_planes_array<'py, T: Element + crop::Sample>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, T>,
-    dmt_shifts: &PyReadonlyArray2<'py, i64>,
-    ft_shifts: &PyReadonlyArray1<'py, i64>,
+    dispersion: &Dispersion<'py>,
     geometry: (usize, usize, usize, usize),
     upstream_rounding: bool,
 ) -> PyResult<CropPlanes<'py>> {
+    let (kdms, ft_kdm, terms, tsamp) = dispersion;
     let (tdf, col0, ncols, threads) = geometry;
     let (nt, nf) = (data.shape()[0], data.shape()[1]);
     if nt == 0 || nf == 0 {
@@ -385,11 +385,16 @@ fn crop_planes_array<'py, T: Element + crop::Sample>(
     let values = data
         .as_slice()
         .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
-    let dmt = dmt_shifts.as_array();
-    let dmsteps = dmt.shape()[0];
-    if dmt.shape()[1] != nf || ft_shifts.len() != nf {
+    let kdms = kdms
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("kdms must be contiguous"))?;
+    let terms = terms
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("frequency_term must be contiguous"))?;
+    let dmsteps = kdms.len();
+    if terms.len() != nf {
         return Err(PyValueError::new_err(format!(
-            "shifts must have {nf} channels"
+            "frequency_term must have {nf} channels"
         )));
     }
     if tdf == 0 || ncols == 0 || (col0 + ncols).checked_mul(tdf).is_none_or(|end| end > nt) {
@@ -397,30 +402,21 @@ fn crop_planes_array<'py, T: Element + crop::Sample>(
             "expected tdf >= 1, ncols >= 1 and (col0 + ncols) * tdf <= data length",
         ));
     }
-    let reduce = |shift: i64| -> PyResult<usize> {
-        usize::try_from(shift)
-            .ok()
-            .filter(|&s| s < nt)
-            .ok_or_else(|| PyValueError::new_err("shifts must lie in [0, data length)"))
-    };
-    let dmt_shifts: Vec<usize> = dmt.iter().map(|&s| reduce(s)).collect::<PyResult<_>>()?;
-    let ft_shifts: Vec<usize> = ft_shifts
-        .as_array()
-        .iter()
-        .map(|&s| reduce(s))
-        .collect::<PyResult<_>>()?;
-    let crop = crop::Crop {
-        nt,
-        nf,
-        dmt_shifts: &dmt_shifts,
-        dmsteps,
-        ft_shifts: &ft_shifts,
-        tdf,
-        col0,
-        ncols,
-        threads,
-    };
+    let (ft_kdm, tsamp) = (*ft_kdm, *tsamp);
     let (dmt_plane, ft_plane) = py.detach(|| {
+        let dmt_shifts = crop::dm_shifts(kdms, terms, tsamp, nt, threads);
+        let ft_shifts = crop::dm_shifts(&[ft_kdm], terms, tsamp, nt, 1);
+        let crop = crop::Crop {
+            nt,
+            nf,
+            dmt_shifts: &dmt_shifts,
+            dmsteps,
+            ft_shifts: &ft_shifts,
+            tdf,
+            col0,
+            ncols,
+            threads,
+        };
         if upstream_rounding {
             crop::upstream(values, &crop)
         } else {
@@ -436,18 +432,33 @@ fn crop_planes_array<'py, T: Element + crop::Sample>(
 
 type CropPlanes<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<f32>>);
 
+/// `(kdms, ft_kdm, frequency_term, tsamp)`: what the shifts are made from.
+type Dispersion<'py> = (
+    PyReadonlyArray1<'py, f64>,
+    f64,
+    PyReadonlyArray1<'py, f64>,
+    f64,
+);
+
 /// Decimated, cropped DM-time and frequency-time planes of integer data:
 /// `(dmt (dmsteps, ncols), ft (ncols, nchans))` float32, columns of `tdf`
-/// samples from column `col0`, each channel rolled by its shift (in
-/// [0, nt)). Exact integer sums divided once, or with `upstream_rounding`,
-/// the float32 rounding of the full-array dedisperse/dmtime/decimate route.
-#[pyfunction(signature = (data, dmt_shifts, ft_shifts, tdf, col0, ncols, threads=1, upstream_rounding=false))]
+/// samples from column `col0`, each channel rolled by its shift. A shift is
+/// made as NumPy makes it from `kdm = 4148808.0 * dm` (`kdms`, one per DM-time
+/// row; `ft_kdm` for the frequency-time plane), the channel's
+/// `frequency_term` (`1 / f0**2 - 1 / f**2`) and `tsamp`: the delay
+/// `kdm * term / 1000.0 / tsamp` rounded half to even, wrapped into
+/// [0, nt) when shorter than the chunk and 0 otherwise. Exact integer sums
+/// divided once, or with `upstream_rounding`, the float32 rounding of the
+/// full-array dedisperse/dmtime/decimate route.
+#[pyfunction(signature = (data, kdms, ft_kdm, frequency_term, tsamp, tdf, col0, ncols, threads=1, upstream_rounding=false))]
 #[allow(clippy::too_many_arguments)]
 fn crop_planes<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyAny>,
-    dmt_shifts: PyReadonlyArray2<'py, i64>,
-    ft_shifts: PyReadonlyArray1<'py, i64>,
+    kdms: PyReadonlyArray1<'py, f64>,
+    ft_kdm: f64,
+    frequency_term: PyReadonlyArray1<'py, f64>,
+    tsamp: f64,
     tdf: usize,
     col0: usize,
     ncols: usize,
@@ -461,14 +472,14 @@ fn crop_planes<'py>(
         ));
     }
     let geometry = (tdf, col0, ncols, threads);
+    let dispersion = (kdms, ft_kdm, frequency_term, tsamp);
     let type_num = data.dtype().num();
     macro_rules! dispatch {
         ($ty:ty) => {
             return crop_planes_array(
                 py,
                 data.cast::<PyArray2<$ty>>()?.readonly(),
-                &dmt_shifts,
-                &ft_shifts,
+                &dispersion,
                 geometry,
                 upstream_rounding,
             )
