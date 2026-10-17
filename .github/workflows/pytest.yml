@@ -54,6 +54,15 @@ jobs:
         run: python -I checks/native_parity.py --missing-rust
       - name: Ruff Format Check
         run: ruff format . --check
+      - name: Ruff lint candidate processing
+        # Legacy lint debt elsewhere remains outside this gate.
+        run: |
+          ruff check \
+            bin/your_candmaker.py checks/ \
+            your/candidate.py your/utils/candidate_*.py \
+            your/utils/gpu*.py your/utils/plotter.py \
+            tests/test_candidate_*.py tests/test_gpu_streaming.py \
+            tests/test_utils_gpu.py
       - name: Run pytest and Generate coverage report
         run: |
           pip install pytest pytest-cov

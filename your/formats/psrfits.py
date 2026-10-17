@@ -324,9 +324,7 @@ class PsrfitsFile(object):
                 data += np.left_shift(data2, 8) + data1
             else:
                 data = np.asarray(sdata)
-        data = data.reshape((nsamp, npoln, self.nchan)).astype(
-            np.float32
-        )
+        data = data.reshape((nsamp, npoln, self.nchan)).astype(np.float32)
         if apply_scales:
             data *= self.get_scales(isub)[: self.nchan]
         if apply_offsets:
@@ -424,9 +422,13 @@ class PsrfitsFile(object):
             self.fits = pyfits.open(self.filename, mode="readonly", memmap=True)
 
         windowed = (
-            nstart >= 0 and nsamp >= 0 and skip >= 0 and trunc >= 0
+            nstart >= 0
+            and nsamp >= 0
+            and skip >= 0
+            and trunc >= 0
             and startsub <= endsub
-            and self.npoln == npoln == 1 and pol == 0
+            and self.npoln == npoln == 1
+            and pol == 0
             and self.nbits in (2, 4, 8, 16, 32)
             and self.nchan * self.nbits % 8 == 0
             and getattr(self.read_subint, "__func__", None) is PsrfitsFile.read_subint
@@ -552,7 +554,9 @@ class SpectraInfo:
             hdu_context = (
                 contextlib.nullcontext(_first_hdu)
                 if ii == 0 and _first_hdu is not None
-                else pyfits.open(fn, mode="readonly", memmap=True, ignore_missing_end=True)
+                else pyfits.open(
+                    fn, mode="readonly", memmap=True, ignore_missing_end=True
+                )
             )
             with hdu_context as hdus:
                 hdus.verify()

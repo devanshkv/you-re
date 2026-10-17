@@ -69,7 +69,11 @@ BASELINE = GEOMETRIES[0]
 # geometries preserve the source body and change only its two tile constants.
 _EPT_REWRITES = (
     (
-        "int lane = threadIdx.x;\n    int time_base = blockIdx.x * TIME_TILE;\n    int time = time_base + lane;",
+        (
+            "int lane = threadIdx.x;\n"
+            "    int time_base = blockIdx.x * TIME_TILE;\n"
+            "    int time = time_base + lane;"
+        ),
         "int lane = threadIdx.x;\n    int time_base = blockIdx.x * TIME_TILE;",
     ),
     ("float sums[DM_TILE] = {0.0f};", "float sums[EPT][DM_TILE] = {};"),
@@ -78,73 +82,95 @@ _EPT_REWRITES = (
         "for (int i = lane; i < count; i += blockDim.x)",
     ),
     (
-        """            if (time < native_count && enabled[local_channel]) {
-                for (int d = 0; d < dm_count; ++d) {
-                    long long delay = delays[(long long)(dm_base + d) * nchans + global_channel];
-                    sums[d] += tile[lane + (int)(delay - minimum)];
-                }
-            }""",
-        """            for (int e = 0; e < EPT; ++e) {
-                int time = time_base + lane + e * blockDim.x;
-                if (time < native_count && enabled[local_channel]) {
-                    for (int d = 0; d < dm_count; ++d) {
-                        long long delay = delays[(long long)(dm_base + d) * nchans + global_channel];
-                        sums[e][d] += tile[lane + e * blockDim.x + (int)(delay - minimum)];
-                    }
-                }
-            }""",
+        (
+            "            if (time < native_count && enabled[local_channel]) {\n"
+            "                for (int d = 0; d < dm_count; ++d) {\n"
+            "                    long long delay = delays[(long long)(dm_base +"
+            " d) * nchans + global_channel];\n"
+            "                    sums[d] += tile[lane + (int)(delay - minimum)];\n"
+            "                }\n"
+            "            }"
+        ),
+        (
+            "            for (int e = 0; e < EPT; ++e) {\n"
+            "                int time = time_base + lane + e * blockDim.x;\n"
+            "                if (time < native_count && enabled[local_channel]) {\n"
+            "                    for (int d = 0; d < dm_count; ++d) {\n"
+            "                        long long delay = delays[(long"
+            " long)(dm_base + d) * nchans + global_channel];\n"
+            "                        sums[e][d] += tile[lane + e * blockDim.x +"
+            " (int)(delay - minimum)];\n"
+            "                    }\n"
+            "                }\n"
+            "            }"
+        ),
     ),
     (
-        """    } else if (time < native_count) {
-        for (int local_channel = 0; local_channel < group_channels; ++local_channel) {
-            int global_channel = channel_start + local_channel;
-            for (int d = 0; d < dm_count; ++d) {
-                long long delay = delays[(long long)(dm_base + d) * nchans + global_channel];
-                sums[d] += sample_at(
-                    source, medians, enabled, local_channel, output_start + time + delay,
-                    source_start, source_count, valid_start, valid_stop, nspectra,
-                    input_scale
-                );
-            }
-        }
-    }
-
-    if (time < native_count) {
-        for (int d = 0; d < dm_count; ++d) {
-            long long index = (long long)(dm_base + d) * native_count + time;
-            if (!first_group) sums[d] += output[index];
-            output[index] = sums[d];
-        }
-    }""",
-        """    } else {
-        for (int e = 0; e < EPT; ++e) {
-            int time = time_base + lane + e * blockDim.x;
-            if (time < native_count) {
-                for (int local_channel = 0; local_channel < group_channels; ++local_channel) {
-                    int global_channel = channel_start + local_channel;
-                    for (int d = 0; d < dm_count; ++d) {
-                        long long delay = delays[(long long)(dm_base + d) * nchans + global_channel];
-                        sums[e][d] += sample_at(
-                            source, medians, enabled, local_channel, output_start + time + delay,
-                            source_start, source_count, valid_start, valid_stop, nspectra,
-                            input_scale
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    for (int e = 0; e < EPT; ++e) {
-        int time = time_base + lane + e * blockDim.x;
-        if (time < native_count) {
-            for (int d = 0; d < dm_count; ++d) {
-                long long index = (long long)(dm_base + d) * native_count + time;
-                if (!first_group) sums[e][d] += output[index];
-                output[index] = sums[e][d];
-            }
-        }
-    }""",
+        (
+            "    } else if (time < native_count) {\n"
+            "        for (int local_channel = 0; local_channel < group_channels;"
+            " ++local_channel) {\n"
+            "            int global_channel = channel_start + local_channel;\n"
+            "            for (int d = 0; d < dm_count; ++d) {\n"
+            "                long long delay = delays[(long long)(dm_base + d) *"
+            " nchans + global_channel];\n"
+            "                sums[d] += sample_at(\n"
+            "                    source, medians, enabled, local_channel,"
+            " output_start + time + delay,\n"
+            "                    source_start, source_count, valid_start,"
+            " valid_stop, nspectra,\n"
+            "                    input_scale\n"
+            "                );\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    if (time < native_count) {\n"
+            "        for (int d = 0; d < dm_count; ++d) {\n"
+            "            long long index = (long long)(dm_base + d) *"
+            " native_count + time;\n"
+            "            if (!first_group) sums[d] += output[index];\n"
+            "            output[index] = sums[d];\n"
+            "        }\n"
+            "    }"
+        ),
+        (
+            "    } else {\n"
+            "        for (int e = 0; e < EPT; ++e) {\n"
+            "            int time = time_base + lane + e * blockDim.x;\n"
+            "            if (time < native_count) {\n"
+            "                for (int local_channel = 0; local_channel <"
+            " group_channels; ++local_channel) {\n"
+            "                    int global_channel = channel_start +"
+            " local_channel;\n"
+            "                    for (int d = 0; d < dm_count; ++d) {\n"
+            "                        long long delay = delays[(long"
+            " long)(dm_base + d) * nchans + global_channel];\n"
+            "                        sums[e][d] += sample_at(\n"
+            "                            source, medians, enabled,"
+            " local_channel, output_start + time + delay,\n"
+            "                            source_start, source_count,"
+            " valid_start, valid_stop, nspectra,\n"
+            "                            input_scale\n"
+            "                        );\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    for (int e = 0; e < EPT; ++e) {\n"
+            "        int time = time_base + lane + e * blockDim.x;\n"
+            "        if (time < native_count) {\n"
+            "            for (int d = 0; d < dm_count; ++d) {\n"
+            "                long long index = (long long)(dm_base + d) *"
+            " native_count + time;\n"
+            "                if (!first_group) sums[e][d] += output[index];\n"
+            "                output[index] = sums[e][d];\n"
+            "            }\n"
+            "        }\n"
+            "    }"
+        ),
     ),
 )
 

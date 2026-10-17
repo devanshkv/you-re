@@ -318,12 +318,9 @@ class SigprocFile(object):
         b1 = b0 + nbytes
 
         start, stop, _ = slice(int(b0), int(b1)).indices(len(self._mmdata))
-        data = (
-            numpy.frombuffer(
-                self._read_data(start, max(0, stop - start)), dtype=self.dtype
-            )
-            .reshape((-1, self.nifs, self.nchans))
-        )
+        data = numpy.frombuffer(
+            self._read_data(start, max(0, stop - start)), dtype=self.dtype
+        ).reshape((-1, self.nifs, self.nchans))
 
         if self.nifs == 1:
             return data

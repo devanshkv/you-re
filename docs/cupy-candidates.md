@@ -119,3 +119,11 @@ The new DM–time mean differs in scale from the old channel sum. Final normaliz
 images cancel that constant scaling. Public `dedispersets()` continues to return
 a channel sum. CPU/GPU agreement is numerical at FP16 accuracy, not bitwise.
 DM optimization is outside the GPU migration; its CLI flag is rejected on GPU.
+
+## Code checks
+
+CI runs `ruff format . --check` across the repository. Its Ruff lint gate covers
+candidate processing, GPU helpers, candidate regression tests, and all `checks/`
+tools. Existing lint debt in other readers, RFI helpers, and older tests remains
+outside that gate; a passing scoped lint check does not mean the whole repository
+passes `ruff check .`.
