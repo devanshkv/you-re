@@ -6,10 +6,39 @@ from your.utils.math import closest_number
 
 logger = logging.getLogger(__name__)
 import argparse
+import functools
 import json
 import os
 
+from scipy import ndimage as _ndimage
 from skimage.transform import resize
+
+from your._rust import gaussian_decimate as _rust_gaussian_decimate
+
+
+class ReadBuffer:
+    """
+    One host buffer, reused for every chunk put in it and grown when a chunk
+    is larger than any before it, so a worker making one candidate after
+    another does not allocate, fault in and zero a fresh array for each.
+
+    Each use overwrites the last, so what is in it is only good until the
+    next: meant for a worker that makes one candidate at a time.
+
+    Args:
+        granule (int): allocation size is rounded up to a multiple of this
+    """
+
+    def __init__(self, granule=64 * 2**20):
+        self.granule = granule
+        self.buffer = None
+
+    def __call__(self, nbytes):
+        if self.buffer is None or self.buffer.size < nbytes:
+            self.buffer = None
+            size = -(-nbytes // self.granule) * self.granule
+            self.buffer = np.empty(size, dtype=np.uint8)
+        return self.buffer
 
 
 def _decimate(data, decimate_factor, axis, pad=False, **kwargs):
@@ -65,9 +94,72 @@ def _resize(data, size, axis, **kwargs):
 
     """
     if axis:
+        if kwargs == {"anti_aliasing": True, "mode": "constant"}:
+            # the candmaker's frequency resize
+            out = _anti_aliased_shrink(data, size)
+            if out is not None:
+                return out
         return resize(data, (data.shape[0], size), **kwargs)
     else:
         return resize(data, (size, data.shape[1]), **kwargs)
+
+
+@functools.lru_cache(maxsize=8)
+def _half_gaussian(factor):
+    """
+    The float64 Gaussian, centre first, that skimage's anti-aliasing applies
+    to an axis it shrinks `factor` times: read off SciPy's own filter as its
+    response to a unit impulse, so the weights are SciPy's to the bit.
+
+    Returns:
+        numpy.ndarray: the centre and one side, or None if not symmetric
+    """
+    sigma = (factor - 1) / 2
+    # SciPy's radius at its default truncate of 4, and one more for a check
+    radius = int(4.0 * sigma + 0.5)
+    impulse = np.zeros(2 * radius + 3)
+    impulse[radius + 1] = 1.0
+    response = _ndimage.gaussian_filter1d(impulse, sigma, mode="constant")
+    if response[0] != 0 or not np.array_equal(response, response[::-1]):
+        return None
+    return response[radius + 1 : 2 * radius + 2].copy()
+
+
+def _anti_aliased_shrink(data, size):
+    """
+    skimage's `resize(data, (data.shape[0], size), anti_aliasing=True,
+    mode="constant")`, bit for bit, for float32 rows shrunk by an integer
+    factor: the Gaussian is computed only at the columns the interpolation
+    reads, instead of all of them.
+
+    Returns:
+        numpy.ndarray: the resized array, or None where skimage is needed
+    """
+    if (
+        type(data) is not np.ndarray
+        or data.dtype != np.float32
+        or data.ndim != 2
+        or data.size == 0
+        or size <= 0
+        or data.shape[1] % size
+        or data.shape[1] // size < 2
+    ):
+        return None
+    lo, hi = data.min(), data.max()
+    # NaN and infinity reach further through SciPy's zero-weight terms
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None
+    factor = data.shape[1] // size
+    weights = _half_gaussian(factor)
+    if weights is None:
+        return None
+    out = _rust_gaussian_decimate(np.ascontiguousarray(data), weights, factor)
+    # skimage's clip: to the input's range, widened to take in cval (0)
+    # where the output reaches it
+    if not lo <= 0 <= hi and out.min() <= 0 <= out.max():
+        lo, hi = min(lo, np.float32(0)), max(hi, np.float32(0))
+    np.clip(out, lo, hi, out=out)
+    return out
 
 
 def crop(data, start_sample, length, axis):

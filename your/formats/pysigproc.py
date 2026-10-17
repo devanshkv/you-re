@@ -286,7 +286,13 @@ class SigprocFile(object):
             return numpy.frombuffer(
                 memoryview(self._mmdata)[start : start + size], dtype=numpy.uint8
             ).copy()
-        data = numpy.empty(size, dtype=numpy.uint8)
+        # a caller making one chunk after another (the candmaker) can hand in a
+        # buffer to reuse, such as a page-locked one the GPU uploads from
+        read_buffer = getattr(self, "read_buffer", None)
+        if read_buffer is None:
+            data = numpy.empty(size, dtype=numpy.uint8)
+        else:
+            data = read_buffer(size)[:size]
         view = memoryview(data)
         done = 0
         while done < size:

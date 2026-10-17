@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod crop;
 mod kernels;
+mod resize;
 
 use kernels::{
     fill_dedisperse, fill_dedispersed, fill_dmtime_packed, fill_rfi_stats, numpy_i64, ToF32,
@@ -367,11 +369,180 @@ fn dmtime<'py>(
     ))
 }
 
+fn crop_planes_array<'py, T: Element + crop::Sample>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, T>,
+    dispersion: &Dispersion<'py>,
+    geometry: (usize, usize, usize, usize),
+    upstream_rounding: bool,
+) -> PyResult<CropPlanes<'py>> {
+    let (kdms, ft_kdm, terms, tsamp) = dispersion;
+    let (tdf, col0, ncols, threads) = geometry;
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    if nt == 0 || nf == 0 {
+        return Err(PyValueError::new_err("data must not be empty"));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let kdms = kdms
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("kdms must be contiguous"))?;
+    let terms = terms
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("frequency_term must be contiguous"))?;
+    let dmsteps = kdms.len();
+    if terms.len() != nf {
+        return Err(PyValueError::new_err(format!(
+            "frequency_term must have {nf} channels"
+        )));
+    }
+    if tdf == 0 || ncols == 0 || (col0 + ncols).checked_mul(tdf).is_none_or(|end| end > nt) {
+        return Err(PyValueError::new_err(
+            "expected tdf >= 1, ncols >= 1 and (col0 + ncols) * tdf <= data length",
+        ));
+    }
+    let (ft_kdm, tsamp) = (*ft_kdm, *tsamp);
+    let (dmt_plane, ft_plane) = py.detach(|| {
+        let dmt_shifts = crop::dm_shifts(kdms, terms, tsamp, nt, threads);
+        let ft_shifts = crop::dm_shifts(&[ft_kdm], terms, tsamp, nt, 1);
+        let crop = crop::Crop {
+            nt,
+            nf,
+            dmt_shifts: &dmt_shifts,
+            dmsteps,
+            ft_shifts: &ft_shifts,
+            tdf,
+            col0,
+            ncols,
+            threads,
+        };
+        if upstream_rounding {
+            crop::upstream(values, &crop)
+        } else {
+            crop::exact(values, &crop)
+        }
+    });
+    let dmt_plane = Array2::from_shape_vec((dmsteps, ncols), dmt_plane)
+        .map_err(|_| PyMemoryError::new_err("DM-time plane is too large"))?;
+    let ft_plane = Array2::from_shape_vec((ncols, nf), ft_plane)
+        .map_err(|_| PyMemoryError::new_err("frequency-time plane is too large"))?;
+    Ok((dmt_plane.into_pyarray(py), ft_plane.into_pyarray(py)))
+}
+
+type CropPlanes<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<f32>>);
+
+/// `(kdms, ft_kdm, frequency_term, tsamp)`: what the shifts are made from.
+type Dispersion<'py> = (
+    PyReadonlyArray1<'py, f64>,
+    f64,
+    PyReadonlyArray1<'py, f64>,
+    f64,
+);
+
+/// Decimated, cropped DM-time and frequency-time planes of integer data:
+/// `(dmt (dmsteps, ncols), ft (ncols, nchans))` float32, columns of `tdf`
+/// samples from column `col0`, each channel rolled by its shift. A shift is
+/// made as NumPy makes it from `kdm = 4148808.0 * dm` (`kdms`, one per DM-time
+/// row; `ft_kdm` for the frequency-time plane), the channel's
+/// `frequency_term` (`1 / f0**2 - 1 / f**2`) and `tsamp`: the delay
+/// `kdm * term / 1000.0 / tsamp` rounded half to even, wrapped into
+/// [0, nt) when shorter than the chunk and 0 otherwise. Exact integer sums
+/// divided once, or with `upstream_rounding`, the float32 rounding of the
+/// full-array dedisperse/dmtime/decimate route.
+#[pyfunction(signature = (data, kdms, ft_kdm, frequency_term, tsamp, tdf, col0, ncols, threads=1, upstream_rounding=false))]
+#[allow(clippy::too_many_arguments)]
+fn crop_planes<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    kdms: PyReadonlyArray1<'py, f64>,
+    ft_kdm: f64,
+    frequency_term: PyReadonlyArray1<'py, f64>,
+    tsamp: f64,
+    tdf: usize,
+    col0: usize,
+    ncols: usize,
+    threads: usize,
+    upstream_rounding: bool,
+) -> PyResult<CropPlanes<'py>> {
+    let data = data.cast::<PyUntypedArray>()?;
+    if data.ndim() != 2 {
+        return Err(PyValueError::new_err(
+            "data must be a two-dimensional array",
+        ));
+    }
+    let geometry = (tdf, col0, ncols, threads);
+    let dispersion = (kdms, ft_kdm, frequency_term, tsamp);
+    let type_num = data.dtype().num();
+    macro_rules! dispatch {
+        ($ty:ty) => {
+            return crop_planes_array(
+                py,
+                data.cast::<PyArray2<$ty>>()?.readonly(),
+                &dispersion,
+                geometry,
+                upstream_rounding,
+            )
+        };
+    }
+    if type_num == dtype::<u8>(py).num() {
+        dispatch!(u8);
+    } else if type_num == dtype::<u16>(py).num() {
+        dispatch!(u16);
+    } else if type_num == dtype::<i16>(py).num() {
+        dispatch!(i16);
+    } else if type_num == dtype::<i32>(py).num() {
+        dispatch!(i32);
+    }
+    Err(PyTypeError::new_err(
+        "data dtype is not supported by your._rust.crop_planes",
+    ))
+}
+
+/// skimage's `resize(data, (nt, nf // factor), anti_aliasing=True,
+/// mode="constant")` of float32 rows before its clip: the Gaussian with the
+/// half kernel `weights` (centre first) at the filtered columns the linear
+/// interpolation reads, rounded as SciPy rounds them.
+#[pyfunction]
+fn gaussian_decimate<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray1<'py, f64>,
+    factor: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    if factor == 0 || nf == 0 || nf % factor != 0 {
+        return Err(PyValueError::new_err(
+            "expected factor >= 1 dividing a non-zero number of columns",
+        ));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let weights = weights
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("weights must be contiguous"))?;
+    if weights.is_empty() {
+        return Err(PyValueError::new_err("weights must not be empty"));
+    }
+    let size = nf / factor;
+    let mut out = Vec::new();
+    out.try_reserve_exact(nt * size)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))?;
+    out.resize(nt * size, 0.0_f32);
+    py.detach(|| resize::gaussian_decimate(values, nf, weights, factor, &mut out));
+    Array2::from_shape_vec((nt, size), out)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))
+        .map(|out| out.into_pyarray(py))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(crop_planes, module)?)?;
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;
     module.add_function(wrap_pyfunction!(dmtime, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_decimate, module)?)?;
     module.add_function(wrap_pyfunction!(rfi_stats, module)?)?;
     Ok(())
 }

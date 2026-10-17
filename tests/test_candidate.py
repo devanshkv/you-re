@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pytest
 
-from your.candidate import Candidate
+from your.candidate import Candidate, channel_median, pad_with_median
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 _install_dir = os.path.abspath(os.path.dirname(__file__))
@@ -233,3 +233,117 @@ def test_kill_mask():
     assert cand.data[:, cand.kill_mask].sum() == 0
     assert cand.data[:, [10, 12, 300]].sum() == 0
     assert cand.data[:, ~cand.kill_mask].sum() != 0
+
+
+@pytest.mark.parametrize("nsamples", [1, 2, 7, 1000, 4097, 8192])
+@pytest.mark.parametrize("nchans", [1, 64, 100, 336])
+def test_channel_median_matches_numpy(nsamples, nchans):
+    rng = np.random.default_rng(nsamples)
+    data = rng.integers(0, 256, (nsamples, nchans), dtype=np.uint8)
+    data[:, 0] = 255
+    if nchans > 1:
+        data[:, 1] = rng.integers(3, 5, nsamples)
+    np.testing.assert_array_equal(channel_median(data), np.median(data, axis=0))
+    # a strided view, as a padded read can be
+    np.testing.assert_array_equal(
+        channel_median(data[::2, ::-1]), np.median(data[::2, ::-1], axis=0)
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32])
+@pytest.mark.parametrize("row0, rows", [(5, 20), (0, 20), (5, 35)])
+def test_pad_with_median_matches_ones_times_median(dtype, row0, rows):
+    rng = np.random.default_rng(0)
+    d = rng.integers(0, 200, (rows, 16)).astype(dtype)
+    old = np.ones((40, 16), dtype=dtype) * np.median(d, axis=0)[None, :]
+    old[row0 : row0 + rows] = d
+    new = pad_with_median(d, 40, row0, dtype)
+    assert new.dtype == dtype
+    np.testing.assert_array_equal(new, old.astype(dtype))
+
+
+@pytest.mark.parametrize("where", ["start", "end", "both"])
+def test_padded_chunk_read_into_place(cand_fil, where):
+    from your.utils.misc import ReadBuffer
+
+    length = cand_fil.your_header.nspectra * cand_fil.native_tsamp
+    if where == "start":
+        cand_fil.tcand = 0.05
+    elif where == "end":
+        cand_fil.tcand = length - 0.05
+    else:
+        cand_fil.dm *= 20  # a chunk longer than the file
+    cand_fil.get_chunk()
+    expected = cand_fil.data.copy()
+    assert expected.shape[0] > cand_fil.your_header.nspectra or where != "both"
+
+    buffer = ReadBuffer(granule=4096)
+    cand_fil.read_buffer = buffer
+    cand_fil.get_chunk()
+    np.testing.assert_array_equal(cand_fil.data, expected)
+    assert np.shares_memory(cand_fil.data, buffer.buffer)
+
+
+@pytest.mark.parametrize("width", [1, 2, 8, 64])
+@pytest.mark.parametrize("upstream_rounding", [True, False])
+def test_crop_planes_match_the_full_route(cand_fil, width, upstream_rounding):
+    from your.utils.misc import _decimate, crop
+
+    cand_fil.width = width
+    cand_fil.get_chunk()
+    tdf = 1 if width < 3 else width // 2
+    time_size = -(-cand_fil.data.shape[0] // tdf) // 2
+    full = Candidate(
+        fp=cand_fil.your_file,
+        dm=cand_fil.dm,
+        tcand=cand_fil.tcand,
+        width=width,
+        label=-1,
+        snr=16.8128,
+        min_samp=256,
+        device=0,
+    )
+    full.data = cand_fil.data
+    full.dmtime()
+    full.dedisperse()
+    dmt, ft = full.dmt, full.dedispersed
+    if tdf != 1:
+        dmt = _decimate(dmt, tdf, 1, pad=True, mode="median")
+        ft = _decimate(ft, tdf, 0, pad=True, mode="median")
+    dmt = crop(dmt, dmt.shape[1] // 2 - time_size // 2, time_size, 1)
+    ft = crop(ft, ft.shape[0] // 2 - time_size // 2, time_size, 0)
+    got = cand_fil.crop_planes(
+        tdf, time_size, upstream_rounding=upstream_rounding, threads=2
+    )
+    # 8-bit sums stay below 2**24 here, so both ways are exact
+    np.testing.assert_array_equal(got[0], dmt)
+    np.testing.assert_array_equal(got[1], ft)
+    assert got[0] is cand_fil.dmt and got[1] is cand_fil.dedispersed
+
+
+def test_candmaker_cpu_path_matches_full_route(cand_fil, monkeypatch):
+    import argparse
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "your_candmaker",
+        os.path.join(os.path.dirname(__file__), "../bin/your_candmaker.py"),
+    )
+    candmaker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(candmaker)
+    cand_fil.width = 8
+    for upstream_rounding in (False, True):
+        args = argparse.Namespace(
+            time_size=64, opt_dm=False, upstream_rounding=upstream_rounding, nproc=2
+        )
+        cand_fil.get_chunk()
+        new = candmaker.cpu_dedisp_dmt(cand_fil, args)
+        planes = (new.dmt.copy(), new.dedispersed.copy())
+        with monkeypatch.context() as m:
+            m.setattr(Candidate, "crop_planes", lambda self, *a, **k: None)
+            cand_fil.get_chunk()
+            old = candmaker.cpu_dedisp_dmt(cand_fil, args)
+        np.testing.assert_array_equal(planes[0], old.dmt)
+        np.testing.assert_array_equal(planes[1], old.dedispersed)
+    assert candmaker.worker_threads(1) >= candmaker.worker_threads(4) >= 1
+    assert candmaker.worker_threads(10**6) == 1
