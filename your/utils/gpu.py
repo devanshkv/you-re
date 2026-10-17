@@ -638,6 +638,8 @@ def process_gpu(
             raise ValueError("resident must be a CuPy array")
         if resident.ndim != 2 or resident.shape[0] != plan.nchans:
             raise ValueError("resident must be channel-major with shape (nchans, N)")
+        if not resident.flags.c_contiguous:
+            raise ValueError("resident must be C-contiguous")
         if int(resident.device.id) != int(device):
             raise ValueError("resident must be on the selected CUDA device")
         source_start = int(resident_start)

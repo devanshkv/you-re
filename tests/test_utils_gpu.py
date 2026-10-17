@@ -170,7 +170,10 @@ def test_process_gpu_accepts_channel_major_resident_without_mutating_it():
     data = _data(np.float32)
     cand = _candidate(data)
     plan = make_plan(cand, time_size=4, frequency_size=3, dmsteps=5)
-    resident = cp.asarray(data.T.copy())
+    backing = cp.empty((data.shape[1] + 2, data.shape[0]), dtype=data.dtype)
+    backing[1:-1] = cp.asarray(data.T)
+    resident = backing[1:-1]
+    assert resident.flags.c_contiguous
     before = resident.copy()
 
     expected = process_cpu(cand, plan, data=data)
@@ -187,6 +190,28 @@ def test_process_gpu_accepts_channel_major_resident_without_mutating_it():
     np.testing.assert_allclose(
         cp.asnumpy(resident), cp.asnumpy(before), rtol=0, atol=0, equal_nan=True
     )
+
+
+def test_process_gpu_rejects_noncontiguous_resident_time_view():
+    import cupy as cp
+
+    data = _data(np.float32)
+    cand = _candidate(data)
+    plan = make_plan(cand, time_size=4, frequency_size=3, dmsteps=5)
+    backing = cp.empty((data.shape[1], data.shape[0] * 2), dtype=data.dtype)
+    backing[:, ::2] = cp.asarray(data.T)
+    resident = backing[:, ::2]
+
+    assert resident.shape == (plan.nchans, data.shape[0])
+    assert not resident.flags.c_contiguous
+    with pytest.raises(ValueError, match="C-contiguous"):
+        process_gpu(
+            cand,
+            plan,
+            resident=resident,
+            resident_start=plan.read_start,
+            device=0,
+        )
 
 
 def test_public_gpu_wrappers_use_direct_bounds_and_explicit_dm_trials():
