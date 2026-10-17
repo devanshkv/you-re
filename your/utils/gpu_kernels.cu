@@ -5,6 +5,47 @@ typedef unsigned short uint16_t;
 typedef short int16_t;
 typedef int int32_t;
 
+template <typename T>
+__device__ inline void corner_turn_body(
+    const T *source, T *destination, long long nsamples, int nchans,
+    long long destination_pitch, long long time_offset
+) {
+    __shared__ T tile[32][33];
+    int channel_tiles = (nchans + 31) / 32;
+    int channel_base = (blockIdx.x % channel_tiles) * 32;
+    long long time_base = (blockIdx.x / channel_tiles) * 32LL;
+    int channel = channel_base + threadIdx.x;
+    long long time = time_base + threadIdx.y;
+    for (int row = 0; row < 32; row += 8) {
+        if (channel < nchans && time + row < nsamples) {
+            tile[threadIdx.y + row][threadIdx.x] =
+                source[(time + row) * nchans + channel];
+        }
+    }
+    __syncthreads();
+    channel = channel_base + threadIdx.y;
+    time = time_base + threadIdx.x;
+    for (int row = 0; row < 32; row += 8) {
+        if (channel + row < nchans && time < nsamples) {
+            destination[(long long)(channel + row) * destination_pitch
+                        + time_offset + time] = tile[threadIdx.x][threadIdx.y + row];
+        }
+    }
+}
+
+#define DECLARE_CORNER_TURN(SIZE, TYPE) \
+extern "C" __global__ void corner_turn_b##SIZE( \
+    const TYPE *source, TYPE *destination, long long nsamples, int nchans, \
+    long long destination_pitch, long long time_offset \
+) { \
+    corner_turn_body(source, destination, nsamples, nchans, destination_pitch, time_offset); \
+}
+
+DECLARE_CORNER_TURN(1, unsigned char)
+DECLARE_CORNER_TURN(2, unsigned short)
+DECLARE_CORNER_TURN(4, unsigned int)
+DECLARE_CORNER_TURN(8, unsigned long long)
+
 static const int TIME_TILE = 128;
 static const int DM_TILE = 8;
 

@@ -72,12 +72,32 @@ def _kernel_functions(cp):
             for key in (
                 "bin_ft",
                 "bin_dmt",
+                *("corner_turn_b" + str(size) for size in (1, 2, 4, 8)),
                 *(name + suffix for name in names for suffix in _DTYPE_SUFFIX.values()),
             )
         }
         cached = (module, functions)
         _KERNELS[device_id] = cached
         return cached
+
+
+def _corner_turn(cp, source, destination, nsamples, time_offset, stream):
+    """Transpose raw time-major samples into a pitched resident channel window."""
+    _, kernels = _kernel_functions(cp)
+    channel_tiles = (source.shape[1] + 31) // 32
+    kernels["corner_turn_b" + str(source.dtype.itemsize)](
+        (((nsamples + 31) // 32) * channel_tiles,),
+        (32, 8),
+        (
+            source,
+            destination,
+            np.int64(nsamples),
+            np.int32(source.shape[1]),
+            np.int64(destination.strides[0] // destination.dtype.itemsize),
+            np.int64(time_offset),
+        ),
+        stream=stream,
+    )
 
 
 def _elapsed_events(cp, events):
@@ -266,18 +286,37 @@ def _shared_limit(cp):
     return int(cp.cuda.Device().attributes.get("MaxSharedMemoryPerBlock", 48 * 1024))
 
 
-def _dmt_shared_capacity(delays, channel_start, channel_stop, max_shared):
-    """Size one shared tile for the widest DM_TILE block in this channel group."""
-    max_spread = 0
-    for dm_start in range(0, delays.shape[0], _DM_TILE):
-        tile = delays[dm_start : dm_start + _DM_TILE, channel_start:channel_stop]
-        if tile.size:
-            max_spread = max(max_spread, int(np.max(np.ptp(tile, axis=0))))
-    capacity = min(
-        _TIME_TILE + max_spread,
-        int(max_shared) // np.dtype(np.float32).itemsize,
+def _dmt_shared_capacities(delays, max_shared):
+    """Size all channel groups from the widest per-channel DM_TILE spread."""
+    dmsteps, nchans = delays.shape
+    if not nchans:
+        return np.empty(0, dtype=np.int64)
+    spreads = np.zeros(nchans, dtype=np.int64)
+    full_stop = dmsteps // _DM_TILE * _DM_TILE
+    if full_stop:
+        tiles = delays[:full_stop].reshape(-1, _DM_TILE, nchans)
+        spreads = np.ptp(tiles, axis=1).max(axis=0)
+    if full_stop < dmsteps:
+        np.maximum(spreads, np.ptp(delays[full_stop:], axis=0), out=spreads)
+    capacities = np.maximum.reduceat(spreads, np.arange(0, nchans, _CHANNEL_TILE))
+    # Preserve the scalar zero floor, including signed ptp overflow.
+    np.maximum(capacities, 0, out=capacities)
+    # Clamp before addition so valid int64 delay spreads cannot overflow.
+    np.minimum(
+        capacities,
+        max(0, int(max_shared) // np.dtype(np.float32).itemsize - _TIME_TILE),
+        out=capacities,
     )
-    return max(_TIME_TILE, capacity)
+    capacities += _TIME_TILE
+    return capacities
+
+
+def _dmt_shared_capacity(delays, channel_start, channel_stop, max_shared):
+    """Size one shared tile for an arbitrary, possibly empty channel range."""
+    capacities = _dmt_shared_capacities(
+        delays[:, channel_start:channel_stop], max_shared
+    )
+    return int(capacities.max(initial=_TIME_TILE))
 
 
 def _compute_binned_products(
@@ -360,6 +399,9 @@ def _compute_binned_products(
                 ft_native = ft_binned = None
             if compute_dmt:
                 dmsteps = int(np.asarray(delays).shape[0])
+                shared_capacities = _dmt_shared_capacities(
+                    np.asarray(delays), _shared_limit(cp)
+                )
                 dmt_native = cp.empty((dmsteps, native_count), dtype=cp.float32)
                 dmt_binned = cp.empty((dmsteps, time_size), dtype=cp.float32)
             else:
@@ -446,9 +488,8 @@ def _compute_binned_products(
                         stream=stream,
                     )
                 if compute_dmt:
-                    max_shared = _shared_limit(cp)
-                    shared_capacity = _dmt_shared_capacity(
-                        np.asarray(delays), channel_start, channel_stop, max_shared
+                    shared_capacity = int(
+                        shared_capacities[channel_start // _CHANNEL_TILE]
                     )
                     shared_bytes = shared_capacity * np.dtype(np.float32).itemsize
                     kernels["dmt_tiled_" + suffix](

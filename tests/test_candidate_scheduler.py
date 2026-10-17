@@ -2,8 +2,11 @@ import gc
 import pickle
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from ctypes import memmove
 from dataclasses import dataclass
 from threading import Barrier, Event, Lock
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +24,7 @@ from your.utils.candidate_scheduler import (
     _queue_candidate_save,
     _ResidentCache,
     _run_batch,
+    _transition_peak,
     choose_memory_budget,
     group_jobs_by_files,
     plan_batches,
@@ -110,7 +114,7 @@ def test_batch_budget_counts_resident_and_each_inflight_workspace():
     assert [candidate.index for candidate in batches[0].jobs] == [0, 1]
     assert (batches[0].read_start, batches[0].read_stop) == (0, 15)
     assert batches[0].workspace_bytes == 12
-    assert batches[0].estimated_peak_bytes == 42
+    assert batches[0].estimated_peak_bytes == 44
 
 
 def test_workspace_pressure_splits_a_batch():
@@ -150,7 +154,7 @@ def test_overlap_resize_drops_cache_when_reload_and_workspace_fit():
         max_inflight=1,
     )
 
-    assert [batch.estimated_peak_bytes for batch in batches] == [10, 10]
+    assert [batch.estimated_peak_bytes for batch in batches] == [19, 19]
     assert [batch.streaming for batch in batches] == [False, False]
     assert [batch.drop_cache_before for batch in batches] == [False, True]
     assert [candidate.index for batch in batches for candidate in batch.jobs] == [0, 1]
@@ -171,7 +175,7 @@ def test_overlap_still_streams_when_reloaded_interval_plus_workspace_exceeds_bud
         max_inflight=1,
     )
 
-    assert [batch.estimated_peak_bytes for batch in batches] == [10, 20]
+    assert [batch.estimated_peak_bytes for batch in batches] == [19, 21]
     assert [batch.streaming for batch in batches] == [False, True]
     assert not batches[1].drop_cache_before
 
@@ -186,13 +190,36 @@ def test_disjoint_cache_move_releases_old_resident_before_allocation():
         jobs,
         nchans=1,
         input_dtype=np.uint8,
-        memory_budget_bytes=10,
+        memory_budget_bytes=11,
         workspace_estimator=estimate,
         max_inflight=1,
     )
 
     assert len(batches) == 2
-    assert [batch.estimated_peak_bytes for batch in batches] == [10, 10]
+    assert not any(batch.streaming for batch in batches)
+    assert [batch.estimated_peak_bytes for batch in batches] == [11, 11]
+
+
+def test_upload_staging_is_counted_and_shrinks_to_the_available_budget():
+    assert _transition_peak(None, (0, 100), 4, 2, 0, 850) == (848, (0, 100), False)
+    assert _transition_peak(None, (0, 100), 4, 2, 0, 807) == (808, (0, 100), False)
+    assert _transition_peak((0, 100), (20, 80), 4, 2, 0, 800) == (800, (0, 100), False)
+    large = 128 * 1024 * 1024
+    assert _transition_peak(None, (0, large), 1, 1, 0, 4 * large)[0] == (
+        large + 64 * 1024 * 1024
+    )
+
+
+def test_staging_minimum_sends_a_full_budget_resident_to_streaming():
+    batches = plan_batches(
+        [job(0, (0, 10), (0, 10))],
+        nchans=2,
+        input_dtype=np.uint16,
+        memory_budget_bytes=40,
+        workspace_estimator=estimate,
+    )
+    assert batches[0].streaming
+    assert batches[0].estimated_peak_bytes == 44
 
 
 def test_choose_memory_budget_validates_fraction():
@@ -318,44 +345,242 @@ def test_explicit_output_paths_are_preflighted_before_workers_start(tmp_path):
         _preflight_output_paths([first, second], tmp_path)
 
 
-def test_resident_cache_rejects_dtype_mismatch_without_narrowing():
-    class Stream:
-        def synchronize(self):
-            pass
+@pytest.fixture
+def fake_cupy(monkeypatch):
+    def empty(shape, dtype):
+        values = np.empty(shape, dtype=dtype)
+        return SimpleNamespace(
+            values=values,
+            shape=values.shape,
+            strides=values.strides,
+            dtype=values.dtype,
+            nbytes=values.nbytes,
+            data=SimpleNamespace(ptr=values.ctypes.data),
+        )
 
-    class Device:
-        def __init__(self, _device):
-            pass
+    def copy_2d(dst, dst_pitch, src, src_pitch, width, height, *_args):
+        for row in range(height):
+            memmove(dst + row * dst_pitch, src + row * src_pitch, width)
 
-        def __enter__(self):
-            return self
+    def corner_turn(_cp, source, destination, nsamples, time_offset, _stream):
+        destination.values[:, time_offset : time_offset + nsamples] = source.values[
+            :nsamples
+        ].T
 
-        def __exit__(self, *_args):
-            return False
+    monkeypatch.setattr("your.utils.gpu._corner_turn", corner_turn)
+    return SimpleNamespace(
+        empty=empty,
+        cuda=SimpleNamespace(
+            Device=lambda _device: nullcontext(),
+            using_allocator=lambda _allocator: nullcontext(),
+            Stream=lambda non_blocking: SimpleNamespace(
+                ptr=0, synchronize=lambda: None
+            ),
+            Event=lambda: SimpleNamespace(
+                record=lambda _stream: None, synchronize=lambda: None
+            ),
+            alloc_pinned_memory=bytearray,
+            get_elapsed_time=lambda *_args: 0.0,
+            runtime=SimpleNamespace(
+                memcpy2DAsync=copy_2d,
+                memcpyAsync=lambda dst, src, size, *_: memmove(dst, src, size),
+                memcpyHostToDevice=1,
+                memcpyDeviceToDevice=2,
+            ),
+        ),
+    )
 
-    stream = Stream()
 
-    class Cuda:
-        pass
+@pytest.mark.parametrize("error_type", [MemoryError, RuntimeError])
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_resident_cache_retries_staging_oom_after_freeing_unused_pool_blocks(
+    fake_cupy, error_type, retry_succeeds
+):
+    source = np.arange(13 * 7, dtype=np.uint16).reshape(13, 7)
+    empty = fake_cupy.empty
+    allocations = []
+    resident = []
+    cleared = []
 
-    Cuda.Stream = staticmethod(lambda non_blocking: stream)
-    Cuda.Device = Device
+    def allocate(shape, dtype):
+        allocations.append(shape)
+        if len(allocations) == 2 or (len(allocations) == 3 and not retry_succeeds):
+            raise error_type("cudaErrorMemoryAllocation: out of memory")
+        result = empty(shape, dtype)
+        if len(allocations) == 1:
+            resident.append(weakref.ref(result.values))
+        return result
 
-    class FakeCuPy:
-        cuda = Cuda()
+    def clear_unused():
+        assert resident[0]() is not None
+        cleared.append(True)
 
-        @staticmethod
-        def empty(_shape, dtype):
-            return type("Array", (), {"dtype": dtype})()
+    fake_cupy.empty = allocate
+    fake_cupy.get_default_memory_pool = lambda: SimpleNamespace(
+        free_all_blocks=clear_unused
+    )
+    cache = _ResidentCache(
+        fake_cupy, SimpleNamespace(get_data=lambda *_args: source), 0, 7, source.dtype
+    )
+    if retry_succeeds:
+        stats = cache.ensure(0, len(source))
+        np.testing.assert_array_equal(cache.array.values, source.T)
+        assert stats["read_bytes"] == stats["upload_bytes"] == source.nbytes
+    else:
+        with pytest.raises(error_type, match="out of memory"):
+            cache.ensure(0, len(source))
+    assert cleared == [True]
+    assert allocations == [(7, 13), (13, 7), (13, 7)]
 
+
+def test_resident_cache_does_not_retry_non_oom_staging_errors(fake_cupy):
+    source = np.zeros((3, 4), dtype=np.uint8)
+    empty = fake_cupy.empty
+    allocations = []
+    cleared = []
+
+    def allocate(shape, dtype):
+        allocations.append(shape)
+        if len(allocations) == 2:
+            raise RuntimeError("invalid CUDA device")
+        return empty(shape, dtype)
+
+    fake_cupy.empty = allocate
+    fake_cupy.get_default_memory_pool = lambda: SimpleNamespace(
+        free_all_blocks=lambda: cleared.append(True)
+    )
+    cache = _ResidentCache(
+        fake_cupy, SimpleNamespace(get_data=lambda *_args: source), 0, 4, source.dtype
+    )
+    with pytest.raises(RuntimeError, match="invalid CUDA device"):
+        cache.ensure(0, len(source))
+    assert not cleared
+    assert allocations == [(4, 3), (3, 4)]
+
+
+def test_resident_cache_rejects_dtype_mismatch_without_narrowing(fake_cupy):
     class Reader:
         @staticmethod
         def get_data(_start, _count):
             return np.ones((1, 1), dtype=np.float32)
 
-    cache = _ResidentCache(FakeCuPy(), Reader(), 0, 1, np.dtype(np.int32))
+    cache = _ResidentCache(fake_cupy, Reader(), 0, 1, np.dtype(np.int32))
     with pytest.raises(TypeError, match="decoded sample dtype"):
         cache.ensure(0, 1)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [np.uint8, np.uint16, np.int16, np.int32, np.float16, np.float32, np.float64],
+)
+@pytest.mark.parametrize("nchans", [3, 17])
+@pytest.mark.parametrize("strided", [False, True])
+def test_resident_cache_copies_exact_transpose_with_partial_block(
+    fake_cupy, dtype, nchans, strided
+):
+    start, count = 11, 385
+    values = np.arange((start + count) * 2 * nchans * 2).reshape(
+        (start + count) * 2, nchans * 2
+    )
+    source = (values - 4096).astype(dtype)[::2, ::-2]
+    if not strided:
+        source = source.copy()
+    reader = SimpleNamespace(get_data=lambda left, size: source[left : left + size])
+    cache = _ResidentCache(fake_cupy, reader, 0, nchans, np.dtype(dtype))
+
+    stats = cache.ensure(start, start + count)
+
+    expected = source[start : start + count].T
+    np.testing.assert_array_equal(cache.array.values, expected)
+    assert cache.array.values.dtype == expected.dtype
+    assert cache.interval == (start, start + count)
+    assert stats["read_bytes"] == stats["upload_bytes"] == expected.nbytes
+
+
+def test_resident_cache_growth_reuses_overlap_and_bounds_staging(fake_cupy):
+    source = np.arange(60 * 37, dtype=np.uint16).reshape(60, 37)
+    reads = []
+
+    def get_data(start, count):
+        reads.append((start, count))
+        return source[start : start + count]
+
+    cache = _ResidentCache(
+        fake_cupy,
+        SimpleNamespace(get_data=get_data),
+        0,
+        37,
+        source.dtype,
+        memory_budget_bytes=74 * 49,
+    )
+    initial = cache.ensure(10, 30)
+    growth = cache.ensure(6, 34)
+    contained = cache.ensure(8, 32)
+
+    np.testing.assert_array_equal(cache.array.values, source[6:34].T)
+    assert reads == [
+        (10, 20),
+        (6, 1),
+        (7, 1),
+        (8, 1),
+        (9, 1),
+        (30, 1),
+        (31, 1),
+        (32, 1),
+        (33, 1),
+    ]
+    assert initial["upload_bytes"] == 20 * 74
+    assert growth["read_bytes"] == growth["upload_bytes"] == 8 * 74
+    assert contained == dict(read_bytes=0, upload_bytes=0, read_s=0.0, upload_s=0.0)
+
+
+def test_resident_cache_rejects_a_budget_without_one_staging_row(fake_cupy):
+    source = np.zeros((10, 4), dtype=np.uint16)
+    cache = _ResidentCache(
+        fake_cupy,
+        SimpleNamespace(get_data=lambda *_args: source),
+        0,
+        4,
+        source.dtype,
+        memory_budget_bytes=source.nbytes,
+    )
+    with pytest.raises(MemoryError, match="upload staging"):
+        cache.ensure(0, len(source))
+
+
+def test_resident_cache_keeps_pinned_upload_alive_on_kernel_failure(
+    fake_cupy, monkeypatch
+):
+    class Pinned(bytearray):
+        pass
+
+    pinned = []
+    synchronized = []
+
+    def allocate(size):
+        buffer = Pinned(size)
+        pinned.append(weakref.ref(buffer))
+        return buffer
+
+    def synchronize():
+        assert pinned[0]() is not None
+        synchronized.append(True)
+
+    def fail_corner_turn(*_args):
+        raise RuntimeError("corner turn launch failed")
+
+    fake_cupy.cuda.alloc_pinned_memory = allocate
+    fake_cupy.cuda.Stream = lambda **_kwargs: SimpleNamespace(
+        ptr=0, synchronize=synchronize
+    )
+    monkeypatch.setattr("your.utils.gpu._corner_turn", fail_corner_turn)
+    source = np.zeros((3, 4), dtype=np.uint8)
+    cache = _ResidentCache(
+        fake_cupy, SimpleNamespace(get_data=lambda *_args: source), 0, 4, source.dtype
+    )
+    with pytest.raises(RuntimeError, match="corner turn launch failed"):
+        cache.ensure(0, len(source))
+    assert synchronized == [True]
 
 
 def test_hdf5_save_is_queued_without_blocking_gpu_worker():

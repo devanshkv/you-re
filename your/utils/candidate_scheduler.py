@@ -184,6 +184,16 @@ def _missing_intervals(
     return [(left, right) for left, right in missing if right > left]
 
 
+def _upload_samples(missing, nchans, itemsize, available_bytes=None):
+    limit = 64 * 1024 * 1024
+    if available_bytes is not None:
+        limit = min(limit, available_bytes)
+    return min(
+        max((stop - start for start, stop in missing), default=0),
+        max(1, limit // (nchans * itemsize)),
+    )
+
+
 def _transition_peak(
     current: tuple[int, int] | None,
     target: tuple[int, int],
@@ -194,9 +204,21 @@ def _transition_peak(
 ) -> tuple[int, tuple[int, int], bool]:
     old_bytes = _resident_bytes(current, nchans, itemsize)
     new_bytes = _resident_bytes(target, nchans, itemsize)
+
+    def upload_peak(previous):
+        live_bytes = new_bytes + _resident_bytes(previous, nchans, itemsize)
+        samples = _upload_samples(
+            _missing_intervals(previous, target),
+            nchans,
+            itemsize,
+            memory_budget_bytes - live_bytes,
+        )
+        return live_bytes + samples * nchans * itemsize
+
+    reload_peak = max(old_bytes, upload_peak(None), new_bytes + workspace_bytes)
     drop_cache = False
     if current is None:
-        resize_peak = new_bytes
+        resize_peak = upload_peak(None)
         final_interval = target
     elif current[0] <= target[0] and target[1] <= current[1]:
         resize_peak = old_bytes
@@ -204,24 +226,21 @@ def _transition_peak(
         if (
             current != target
             and old_bytes + workspace_bytes > memory_budget_bytes
-            and new_bytes + workspace_bytes <= memory_budget_bytes
+            and reload_peak <= memory_budget_bytes
         ):
-            resize_peak = max(old_bytes, new_bytes + workspace_bytes)
+            resize_peak = reload_peak
             final_interval = target
             drop_cache = True
     elif max(current[0], target[0]) < min(current[1], target[1]):
-        resize_peak = old_bytes + new_bytes
-        if (
-            resize_peak > memory_budget_bytes
-            and new_bytes + workspace_bytes <= memory_budget_bytes
-        ):
+        resize_peak = upload_peak(current)
+        if resize_peak > memory_budget_bytes and reload_peak <= memory_budget_bytes:
             # Re-read the target after releasing the overlapping allocation.
-            resize_peak = max(old_bytes, new_bytes + workspace_bytes)
+            resize_peak = reload_peak
             drop_cache = True
         final_interval = target
     else:
         # Disjoint windows can release the old allocation before replacing it.
-        resize_peak = max(old_bytes, new_bytes)
+        resize_peak = max(old_bytes, upload_peak(None))
         final_interval = target
     peak = max(
         resize_peak, _resident_bytes(final_interval, nchans, itemsize) + workspace_bytes
@@ -363,12 +382,21 @@ def _assign_work(
 
 
 class _ResidentCache:
-    def __init__(self, cp, reader, device: int, nchans: int, dtype: np.dtype):
+    def __init__(
+        self,
+        cp,
+        reader,
+        device: int,
+        nchans: int,
+        dtype: np.dtype,
+        memory_budget_bytes: int | None = None,
+    ):
         self.cp = cp
         self.reader = reader
         self.device = device
         self.nchans = nchans
         self.dtype = dtype
+        self.memory_budget_bytes = memory_budget_bytes
         self.array = None
         self.start = None
         self.stream = cp.cuda.Stream(non_blocking=True)
@@ -386,6 +414,8 @@ class _ResidentCache:
             and stop <= self.start + self.array.shape[1]
         ):
             return {"read_bytes": 0, "upload_bytes": 0, "read_s": 0.0, "upload_s": 0.0}
+
+        from your.utils.gpu import _corner_turn
 
         cp = self.cp
         previous = self.array
@@ -431,14 +461,39 @@ class _ResidentCache:
         upload_bytes = 0
         read_seconds = 0.0
         upload_seconds = 0.0
-        max_pinned_bytes = 64 * 1024 * 1024
-        samples_per_upload = max(
-            1, max_pinned_bytes // (self.nchans * self.dtype.itemsize)
-        )
         previous_interval = (
             (previous_start, previous_stop) if previous is not None else None
         )
         missing = _missing_intervals(previous_interval, (start, stop))
+        available_bytes = (
+            None
+            if self.memory_budget_bytes is None
+            else self.memory_budget_bytes
+            - new.nbytes
+            - (previous.nbytes if previous is not None else 0)
+        )
+        samples_per_upload = _upload_samples(
+            missing, self.nchans, self.dtype.itemsize, available_bytes
+        )
+        if missing:
+            if (
+                available_bytes is not None
+                and available_bytes < self.nchans * self.dtype.itemsize
+            ):
+                raise MemoryError("GPU cache upload staging exceeds the memory budget")
+            # Keep staging out of the pool so job workspaces can use its memory.
+            with cp.cuda.Device(self.device), cp.cuda.using_allocator(None):
+                try:
+                    staging = cp.empty(
+                        (samples_per_upload, self.nchans), dtype=self.dtype
+                    )
+                except Exception as exc:
+                    if not _is_out_of_memory(exc):
+                        raise
+                    cp.get_default_memory_pool().free_all_blocks()
+                    staging = cp.empty(
+                        (samples_per_upload, self.nchans), dtype=self.dtype
+                    )
 
         for missing_start, missing_stop in missing:
             for read_start in range(missing_start, missing_stop, samples_per_upload):
@@ -461,34 +516,44 @@ class _ResidentCache:
                 count = (read_stop - read_start) * self.nchans
                 pinned = cp.cuda.alloc_pinned_memory(count * self.dtype.itemsize)
                 host = np.frombuffer(pinned, dtype=self.dtype, count=count).reshape(
-                    self.nchans, read_stop - read_start
+                    read_stop - read_start, self.nchans
                 )
-                np.copyto(host, host_time_major.T, casting="no")
+                np.copyto(host, host_time_major, casting="no")
                 read_seconds += perf_counter() - t0
                 read_bytes += int(host.nbytes)
                 upload_bytes += int(host.nbytes)
 
-                dst = new.data.ptr + (read_start - start) * self.dtype.itemsize
                 upload_start = cp.cuda.Event()
                 upload_stop = cp.cuda.Event()
                 upload_start.record(self.stream)
-                cp.cuda.runtime.memcpy2DAsync(
-                    dst,
-                    new.strides[0],
-                    host.ctypes.data,
-                    host.strides[0],
-                    host.shape[1] * self.dtype.itemsize,
-                    self.nchans,
-                    cp.cuda.runtime.memcpyHostToDevice,
-                    self.stream.ptr,
-                )
-                upload_stop.record(self.stream)
-                upload_stop.synchronize()
+                try:
+                    cp.cuda.runtime.memcpyAsync(
+                        staging.data.ptr,
+                        host.ctypes.data,
+                        host.nbytes,
+                        cp.cuda.runtime.memcpyHostToDevice,
+                        self.stream.ptr,
+                    )
+                    _corner_turn(
+                        cp,
+                        staging,
+                        new,
+                        read_stop - read_start,
+                        read_start - start,
+                        self.stream,
+                    )
+                    upload_stop.record(self.stream)
+                    upload_stop.synchronize()
+                except BaseException:
+                    self.stream.synchronize()
+                    raise
                 upload_seconds += (
                     cp.cuda.get_elapsed_time(upload_start, upload_stop) / 1000.0
                 )
                 del host, pinned, host_time_major
 
+        if missing:
+            del staging
         self.array = new
         self.start = start
         del previous
@@ -841,7 +906,9 @@ def _gpu_worker(
                     try:
                         nchans = int(base.your_header.nchans)
                         input_dtype = decoded_sample_dtype(base)
-                        cache = _ResidentCache(cp, base, device, nchans, input_dtype)
+                        cache = _ResidentCache(
+                            cp, base, device, nchans, input_dtype, budget
+                        )
                         batches = plan_batches(
                             work.jobs,
                             nchans=nchans,

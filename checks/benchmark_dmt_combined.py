@@ -61,7 +61,7 @@ def run_case(cp, gpu, case, condition, source_modules, original_compute):
         source_variant = "baseline"
 
     module = source_modules["modules"][(source_variant, geometry.name)]
-    original_capacity = gpu._dmt_shared_capacity
+    original_capacity = gpu._dmt_shared_capacities
     original_kernel_functions = gpu._kernel_functions
     gpu._TIME_TILE = geometry.time_tile
     gpu._DM_TILE = geometry.dm_tile
@@ -70,7 +70,10 @@ def run_case(cp, gpu, case, condition, source_modules, original_compute):
     gpu._kernel_functions = lambda _cp, m=module: m
     geometry_bench.install_ept_launch(gpu, original_compute, geometry.ept)
     if staging == "direct_gather":
-        gpu._dmt_shared_capacity = lambda _delays, _start, _stop, _limit: 0
+        gpu._dmt_shared_capacities = lambda delays, _limit: np.zeros(
+            (delays.shape[1] + gpu._CHANNEL_TILE - 1) // gpu._CHANNEL_TILE,
+            dtype=np.int64,
+        )
     try:
         products = gpu.process_gpu(
             case.cand,
@@ -83,7 +86,7 @@ def run_case(cp, gpu, case, condition, source_modules, original_compute):
         wall_s = perf_counter() - started
     finally:
         gpu._compute_binned_products = original_compute
-        gpu._dmt_shared_capacity = original_capacity
+        gpu._dmt_shared_capacities = original_capacity
         gpu._kernel_functions = original_kernel_functions
     return products, wall_s, guard_passed
 
@@ -130,7 +133,7 @@ def main():
             "_DM_TILE",
             "_CHANNEL_TILE",
             "_kernel_functions",
-            "_dmt_shared_capacity",
+            "_dmt_shared_capacities",
         )
     }
     sentinel = object()

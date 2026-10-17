@@ -180,16 +180,18 @@ def run_process(gpu, cp, modules, variant, case, *, profile=True, measure_dmt=Fa
                 timed[name] = timer
         kernels = wrapped
 
-    original_capacity = gpu._dmt_shared_capacity
+    original_capacity = gpu._dmt_shared_capacities
     original_kernel_functions = gpu._kernel_functions
     if variant == "direct_gather":
-        gpu._dmt_shared_capacity = lambda _delays, _start, _stop, _limit: 0
+        gpu._dmt_shared_capacities = lambda delays, _limit: np.zeros(
+            (delays.shape[1] + gpu._CHANNEL_TILE - 1) // gpu._CHANNEL_TILE,
+            dtype=np.int64,
+        )
     elif variant in SHARED_CAPS:
         shared_cap = SHARED_CAPS[variant]
-        gpu._dmt_shared_capacity = lambda delays, start, stop, limit: min(
-            original_capacity(delays, start, stop, limit),
-            shared_cap,
-            int(limit) // np.dtype(np.float32).itemsize,
+        gpu._dmt_shared_capacities = lambda delays, limit: np.minimum(
+            original_capacity(delays, limit),
+            min(shared_cap, int(limit) // np.dtype(np.float32).itemsize),
         )
 
     gpu._kernel_functions = lambda _cp, m=module, f=kernels: (m, f)
@@ -210,7 +212,7 @@ def run_process(gpu, cp, modules, variant, case, *, profile=True, measure_dmt=Fa
             else None
         )
     finally:
-        gpu._dmt_shared_capacity = original_capacity
+        gpu._dmt_shared_capacities = original_capacity
         gpu._kernel_functions = original_kernel_functions
     return products, wall_s, measurements or {}, dmt_s, effective, guard_applied
 

@@ -41,18 +41,24 @@ The CLI retains compact planning metadata rather than a full DM-by-channel
 delay table for every candidate. It closes each observation reader after planning;
 workers build full delay tables only for active candidates. Jobs are grouped by
 resolved observation file sets and sorted by required input interval. Each GPU retains immutable channel-major raw samples and uploads only
-missing coverage as its resident window advances. Candidate-specific medians,
+missing coverage as its resident window advances. Input uploads use contiguous
+pinned time-major chunks followed by a bit-preserving GPU corner turn into the
+channel-major cache. Candidate-specific medians,
 kill masks and optional RFI masks do not change with batch composition.
 
 `--gpu_inflight` bounds simultaneous candidate processing (default 2).
 `--gpu_memory_mb` bounds the estimated working set; the default reserves a
 fraction of currently free memory. Estimates include resident input, old plus
-new buffers during overlap reuse, native intermediates, delay tables, median
+new buffers during overlap reuse, bounded GPU transpose staging, native
+intermediates, delay tables, median
 workspace and all in-flight candidates. HDF5 writes use a bounded CPU writer
 queue and can overlap later GPU work. If only the old-plus-new cache replacement
 exceeds the budget, the worker releases the old cache and reloads; this does not
 force an otherwise fitting candidate into streaming. Input storage and memory
 estimates use the decoded sample dtype, including calibrated PSRFITS floats.
+Transpose staging is capped at 64 MiB, shrinks to fit the budget, and is released
+before candidate workspaces are allocated. The `cache_upload_s` profile counter
+includes both the raw transfer and GPU corner turn.
 
 A singleton exceeding the memory budget uses disk-backed host staging, exact
 host padding statistics, and bounded GPU channel/DM/time tiles. Channel partials
