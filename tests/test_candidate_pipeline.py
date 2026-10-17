@@ -6,6 +6,7 @@ import pytest
 from your.utils.candidate_pipeline import (
     _channel_medians,
     finish_products,
+    make_compact_plan,
     make_plan,
     process_cpu,
     read_plan_data,
@@ -70,6 +71,162 @@ def test_make_plan_uses_ties_to_even_and_fixed_output_overrides():
     np.testing.assert_array_equal(one_trial.dm_values, [0.0])
     assert one_trial.delays.shape == (1, 2)
     assert one_trial.output_dtype == np.dtype(np.float16)
+
+
+@pytest.mark.parametrize(
+    "frequencies",
+    [(1000.0, 1200.0, 1400.0), (1400.0, 1200.0, 1000.0), (1200.0, 1000.0, 1400.0)],
+)
+@pytest.mark.parametrize("dmsteps", [1, 2, 3, 9, 257])
+@pytest.mark.parametrize(
+    "metadata", [dict(), dict(dm=0.0), dict(tcand=-0.0003), dict(nspectra=0)]
+)
+def test_compact_plan_matches_full_table_bounds(frequencies, dmsteps, metadata):
+    from your.utils.candidate_scheduler import CompactCandidatePlan
+
+    cand = _candidate(frequencies, width=5, **metadata)
+    full = make_plan(cand, time_size=9, frequency_size=7, dmsteps=dmsteps)
+    compact = make_compact_plan(cand, time_size=9, frequency_size=7, dmsteps=dmsteps)
+    assert compact == CompactCandidatePlan.from_plan(full)
+    assert not any(isinstance(value, np.ndarray) for value in vars(compact).values())
+
+    # Independently enumerate every output delay, including the FT DM for one trial.
+    trials = np.linspace(0.0, 2.0 * cand.dm, dmsteps)
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    frequency_term = 1.0 / frequencies**2 - 1.0 / np.max(frequencies) ** 2
+    samples = (
+        4148808.0
+        * np.append(trials, cand.dm)[:, None]
+        * frequency_term[None, :]
+        / 1000.0
+        / cand.native_tsamp
+    )
+    expected = np.rint(samples).astype(np.int64)
+    np.testing.assert_array_equal(full.delays, expected[:-1])
+    np.testing.assert_array_equal(full.ft_delays, expected[-1])
+    assert np.all(np.diff(expected[:-1], axis=0) >= 0)
+    assert compact.required_start == full.output_start + int(expected.min())
+    assert compact.required_stop == full.output_start + full.native_count + int(
+        expected.max()
+    )
+    if cand.tcand < 0:
+        assert full.output_start == -9  # floor(-0.3) minus four two-sample bins.
+        assert compact.pad_before == 9
+    if cand.your_header.nspectra == 0:
+        assert compact.read_start == compact.read_stop == 0
+        assert (
+            compact.pad_before + compact.pad_after
+            == compact.required_stop - compact.required_start
+        )
+
+
+@pytest.mark.parametrize("samples", [0.5, 1.5, 2.5])
+@pytest.mark.parametrize("toward", [0.0, None, np.inf])
+def test_compact_plan_preserves_rounding_near_half_samples(samples, toward):
+    delay = 4148808.0 * 3.0 * (1.0 / 1000.0**2 - 1.0 / 2000.0**2) / 1000.0
+    samples = samples if toward is None else np.nextafter(samples, toward)
+    cand = _candidate((1000.0, 2000.0), dm=3.0, tsamp=delay / samples, tcand=0.0)
+    compact = make_compact_plan(cand, time_size=4, dmsteps=1)
+    full = make_plan(cand, time_size=4, dmsteps=1)
+    assert compact.required_stop == 2 + int(np.rint(delay / cand.native_tsamp))
+    assert compact.required_stop == full.required_stop
+
+
+def test_compact_plan_allocates_only_one_delay_row_then_materializes_on_demand(
+    monkeypatch,
+):
+    from your.utils import candidate_pipeline
+
+    finite_delay_bins = candidate_pipeline._finite_delay_bins
+    rows = []
+
+    def record_rows(dm_values, frequencies, tsamp):
+        rows.append(len(dm_values))
+        return finite_delay_bins(dm_values, frequencies, tsamp)
+
+    monkeypatch.setattr(candidate_pipeline, "_finite_delay_bins", record_rows)
+    cand = _candidate(np.linspace(1400.0, 1000.0, 4096))
+    compact = make_compact_plan(cand)
+    assert rows == [1]
+    assert compact.dmsteps == 256
+    assert not any(isinstance(value, np.ndarray) for value in vars(compact).values())
+    full = compact.materialize(cand)
+    assert rows == [1, 256, 1]
+    assert full.delays.shape == (256, 4096)
+
+
+@pytest.mark.parametrize(
+    "metadata, options, message",
+    [
+        (dict(dm=-1.0), {}, "candidate DM"),
+        (dict(dm=np.nan), {}, "candidate DM"),
+        (dict(dm=np.inf), {}, "candidate DM"),
+        (dict(dm=np.array([1.0, 2.0])), {}, "valid planning metadata"),
+        (dict(tcand=np.nan), {}, "candidate time"),
+        (dict(tsamp=0.0), {}, "native_tsamp"),
+        (dict(tsamp=-0.001), {}, "native_tsamp"),
+        (dict(tsamp=np.inf), {}, "native_tsamp"),
+        (dict(width=True), {}, "candidate width"),
+        (dict(width=np.bool_(True)), {}, "valid planning metadata"),
+        (dict(width=-1), {}, "candidate width"),
+        (dict(width=1.5), {}, "valid planning metadata"),
+        (dict(nspectra=True), {}, "candidate nspectra"),
+        (dict(nspectra=-1), {}, "candidate nspectra"),
+        (dict(frequencies=()), {}, "one-dimensional"),
+        (dict(frequencies=np.array(1000.0)), {}, "one-dimensional"),
+        (dict(frequencies=((1000.0, 1200.0),)), {}, "one-dimensional"),
+        (dict(frequencies=(0.0, 1000.0)), {}, "finite and positive"),
+        (dict(frequencies=(-1000.0, 1200.0)), {}, "finite and positive"),
+        (dict(frequencies=(np.nan, 1000.0)), {}, "finite and positive"),
+        (dict(frequencies=(np.inf, 1000.0)), {}, "finite and positive"),
+        (dict(frequencies=("1000", "1200")), {}, "must be numeric"),
+        (dict(frequencies=(1000.0 + 0j,)), {}, "must be numeric"),
+        ({}, dict(time_size=True), "time_size"),
+        ({}, dict(frequency_size=np.bool_(True)), "frequency_size"),
+        ({}, dict(dmsteps=False), "dmsteps"),
+        ({}, dict(time_size=0), "time_size"),
+        ({}, dict(dmsteps=1.5), "dmsteps"),
+        ({}, dict(time_size=np.array([2])), "time_size"),
+        ({}, dict(output_dtype="int16"), "output_dtype"),
+        ({}, dict(time_size=2**63), "native output window"),
+        (dict(tcand=1e308), {}, "candidate sample index"),
+        (dict(tcand=1e20), {}, "required sample range"),
+        ({}, dict(time_size=2**63 - 1), "required sample window"),
+        (dict(dm=1e308), {}, "DM trial values"),
+        (dict(tsamp=np.nextafter(0.0, 1.0), tcand=0.0), {}, "dispersion delays"),
+        (dict(tsamp=1e-30), {}, "dispersion delay exceeds"),
+    ],
+)
+def test_compact_and_full_plans_preserve_metadata_validation(
+    metadata, options, message
+):
+    cand = _candidate(
+        **{name: value for name, value in metadata.items() if name != "frequencies"}
+    )
+    if "frequencies" in metadata:
+        cand.chan_freqs = np.asarray(metadata["frequencies"])
+    errors = []
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        for planner in (make_plan, make_compact_plan):
+            with pytest.raises(ValueError, match=message) as error:
+                planner(cand, **options)
+            errors.append(str(error.value))
+    assert errors[0] == errors[1]
+
+
+def test_compact_plan_accepts_zero_dimensional_numeric_metadata():
+    cand = _candidate(
+        dm=np.array(3.0),
+        tcand=np.array(0.5),
+        tsamp=np.array(0.001),
+        width=np.array(5),
+        nspectra=np.array(2000),
+    )
+    compact = make_compact_plan(cand, time_size=np.array(9), dmsteps=np.int64(1))
+    full = compact.materialize(cand)
+    assert compact.native_count == 18
+    assert compact.required_start == full.required_start
+    assert compact.required_stop == full.required_stop
 
 
 @pytest.mark.parametrize(

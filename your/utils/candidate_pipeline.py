@@ -73,6 +73,25 @@ def make_plan(
     output_dtype="float16",
 ):
     """Create a fixed-shape plan without reading or mutating candidate data."""
+    return _make_plan(
+        cand, time_size, frequency_size, dmsteps, output_dtype, compact=False
+    )
+
+
+def make_compact_plan(
+    cand,
+    time_size=256,
+    frequency_size=256,
+    dmsteps=256,
+    output_dtype="float16",
+):
+    """Plan exact read bounds without allocating the worker's DM delay table."""
+    return _make_plan(
+        cand, time_size, frequency_size, dmsteps, output_dtype, compact=True
+    )
+
+
+def _make_plan(cand, time_size, frequency_size, dmsteps, output_dtype, *, compact):
     time_size = _positive_index(time_size, "time_size")
     frequency_size = _positive_index(frequency_size, "frequency_size")
     dmsteps = _positive_index(dmsteps, "dmsteps")
@@ -128,13 +147,18 @@ def make_plan(
     dm_values = np.linspace(0.0, 2.0 * dm, dmsteps, dtype=np.float64)
     if not np.all(np.isfinite(dm_values)):
         raise ValueError("DM trial values must be finite")
-    delays = _finite_delay_bins(dm_values, frequencies, tsamp)
-    ft_delays = _finite_delay_bins(
-        np.array([dm], dtype=np.float64), frequencies, tsamp
-    )[0]
-
-    min_delay = int(min(np.min(delays), np.min(ft_delays)))
-    max_delay = int(max(np.max(delays), np.max(ft_delays)))
+    if compact:
+        # Nonnegative DM and frequency terms make rounded delays monotone in DM.
+        max_dm = max(dm, float(np.max(dm_values)))
+        bounds = _finite_delay_bins(np.array([max_dm]), frequencies, tsamp)
+        min_delay, max_delay = 0, int(np.max(bounds))
+    else:
+        delays = _finite_delay_bins(dm_values, frequencies, tsamp)
+        ft_delays = _finite_delay_bins(
+            np.array([dm], dtype=np.float64), frequencies, tsamp
+        )[0]
+        min_delay = int(min(np.min(delays), np.min(ft_delays)))
+        max_delay = int(max(np.max(delays), np.max(ft_delays)))
     required_start = output_start + min_delay
     required_stop = output_start + native_count + max_delay
     int64 = np.iinfo(np.int64)
@@ -150,17 +174,12 @@ def make_plan(
     pad_before = max(0, min(required_stop, 0) - required_start)
     pad_after = max(0, required_stop - max(required_start, nspectra))
 
-    return CandidatePlan(
+    metadata = dict(
         time_size=time_size,
         frequency_size=frequency_size,
         dmsteps=dmsteps,
         output_dtype=dtype,
-        time_bin=time_bin,
-        output_start=output_start,
         native_count=native_count,
-        dm_values=dm_values,
-        delays=delays,
-        ft_delays=ft_delays,
         required_start=required_start,
         required_stop=required_stop,
         read_start=read_start,
@@ -170,6 +189,18 @@ def make_plan(
         nchans=int(frequencies.size),
         pad_before=pad_before,
         pad_after=pad_after,
+    )
+    if compact:
+        from your.utils.candidate_scheduler import CompactCandidatePlan
+
+        return CompactCandidatePlan(**metadata)
+    return CandidatePlan(
+        time_bin=time_bin,
+        output_start=output_start,
+        dm_values=dm_values,
+        delays=delays,
+        ft_delays=ft_delays,
+        **metadata,
     )
 
 

@@ -23,10 +23,9 @@ import numpy as np
 import pandas as pd
 
 from your.candidate import Candidate
-from your.utils.candidate_pipeline import make_plan
+from your.utils.candidate_pipeline import make_compact_plan
 from your.utils.candidate_scheduler import (
     CandidateJob,
-    CompactCandidatePlan,
     run_jobs,
 )
 from your.utils.misc import YourArgparseFormatter
@@ -489,15 +488,13 @@ if __name__ == "__main__":
                         output_filename = f"{reader.id}_{i}_{suffix}.h5"
                         suffix += 1
 
-                    full_plan = make_plan(
+                    plan = make_compact_plan(
                         reader,
                         values.time_size,
                         values.frequency_size,
                         values.dmsteps,
                         values.output_dtype,
                     )
-                    plan = CompactCandidatePlan.from_plan(full_plan)
-                    del full_plan
                     jobs.append(CandidateJob(files, kwargs, plan, i, output_filename))
                     output_names.add(output_filename)
             finally:

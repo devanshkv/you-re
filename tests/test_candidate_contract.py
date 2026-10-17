@@ -68,3 +68,124 @@ def test_decoded_sample_dtype_uses_zero_length_fallbacks_without_reading():
 
     assert decoded_sample_dtype(psrfits) == np.dtype(np.float32)
     assert decoded_sample_dtype(generic) == np.dtype(np.uint16)
+
+
+def test_candmaker_parent_uses_compact_plans_and_preserves_csv_width(
+    tmp_path, monkeypatch
+):
+    import csv
+    import runpy
+    import sys
+    from pathlib import Path
+
+    from your import candidate as candidate_module
+    from your.utils import candidate_pipeline, candidate_scheduler
+
+    class Reader:
+        instances = []
+
+        def __init__(self, _files, **kwargs):
+            self.instances.append(self)
+            self.native_tsamp = 0.001
+            self.chan_freqs = np.array([1400.0, 1000.0])
+            self.nchans = 2
+            self.your_header = SimpleNamespace(nspectra=2000)
+            self.id = "candidate-id"
+            self.closed = False
+            self._reset_candidate(width=2, tcand=0.5, **kwargs)
+
+        def _reset_candidate(self, **kwargs):
+            self.__dict__.update(kwargs)
+            return self
+
+        def close(self):
+            self.closed = True
+
+    csv_path = tmp_path / "candidates.csv"
+    with csv_path.open("w", newline="") as output:
+        writer = csv.writer(output)
+        writer.writerow(
+            [
+                "file",
+                "snr",
+                "width",
+                "dm",
+                "label",
+                "stime",
+                "chan_mask_path",
+                "num_files",
+            ]
+        )
+        writer.writerow(["obs.fil", 10, 3, 20, 0, 0.5, "", 1])
+        writer.writerow(["obs.fil", 10, 4, 20, 0, 0.5, "", 1])
+
+    full_planner = candidate_pipeline.make_plan
+    compact_planner = candidate_pipeline.make_compact_plan
+    full_calls, compact_widths, jobs = [], [], []
+
+    def record_full(candidate, *args, **kwargs):
+        full_calls.append(candidate)
+        return full_planner(candidate, *args, **kwargs)
+
+    def record_compact(candidate, *args, **kwargs):
+        compact_widths.append(candidate.width)
+        return compact_planner(candidate, *args, **kwargs)
+
+    def capture_jobs(planned_jobs, **kwargs):
+        assert full_calls == []
+        assert kwargs["gpu_ids"] == [0]
+        jobs.extend(planned_jobs)
+        return []
+
+    monkeypatch.setattr(candidate_module, "Candidate", Reader)
+    monkeypatch.setattr(candidate_pipeline, "make_plan", record_full)
+    monkeypatch.setattr(candidate_pipeline, "make_compact_plan", record_compact)
+    monkeypatch.setattr(candidate_scheduler, "run_jobs", capture_jobs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "your_candmaker.py",
+            "-c",
+            str(csv_path),
+            "-g",
+            "0",
+            "-o",
+            str(tmp_path),
+            "--time_size",
+            "4",
+            "--frequency_size",
+            "3",
+            "--dmsteps",
+            "256",
+            "--no_log_file",
+        ],
+    )
+    runpy.run_path(
+        str(Path(__file__).parents[1] / "bin" / "your_candmaker.py"),
+        run_name="__main__",
+    )
+
+    assert compact_widths == [8, 16]
+    assert [job.candidate_kwargs["width"] for job in jobs] == [8, 16]
+    assert [job.output_filename for job in jobs] == [
+        "candidate-id.h5",
+        "candidate-id_1.h5",
+    ]
+    assert len(Reader.instances) == 1
+    assert Reader.instances[0].closed
+    assert full_calls == []
+    assert all(
+        isinstance(job.plan, candidate_scheduler.CompactCandidatePlan) for job in jobs
+    )
+    assert all(
+        not any(isinstance(value, np.ndarray) for value in vars(job.plan).values())
+        for job in jobs
+    )
+
+    active = Reader.instances[0]._reset_candidate(**jobs[0].candidate_kwargs)
+    materialized = candidate_scheduler._materialize_plan(active, jobs[0].plan)
+    assert full_calls == [active]
+    assert materialized.delays.shape == (256, 2)
+    assert materialized.required_start == jobs[0].plan.required_start
+    assert materialized.required_stop == jobs[0].plan.required_stop
