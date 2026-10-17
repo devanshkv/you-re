@@ -4,10 +4,9 @@ import argparse
 import glob
 import logging
 import os
+from time import perf_counter
 
 from rich.logging import RichHandler
-
-from your.utils.math import normalise
 
 os.environ["OPENBLAS_NUM_THREADS"] = (
     "1"  # stop numpy multithreading regardless of the backend
@@ -23,8 +22,13 @@ from multiprocessing.util import Finalize
 import numpy as np
 import pandas as pd
 
-from your.candidate import Candidate, crop
-from your.utils.gpu import gpu_dedisp_and_dmt_crop
+from your.candidate import Candidate
+from your.utils.candidate_pipeline import make_plan
+from your.utils.candidate_scheduler import (
+    CandidateJob,
+    CompactCandidatePlan,
+    run_jobs,
+)
 from your.utils.misc import YourArgparseFormatter
 
 logger = logging.getLogger()
@@ -34,79 +38,22 @@ _worker_candidate_key = None
 _worker_candidate_finalizer = None
 
 
-def cpu_dedisp_dmt(cand, args):
-    pulse_width = cand.width
-    if pulse_width == 1:
-        time_decimate_factor = 1
-    else:
-        time_decimate_factor = pulse_width // 2
-    logger.debug(f"Time decimation factor {time_decimate_factor}")
-
-    # Plan the same crop on the padded, decimated time axis. Only bypass full
-    # arrays when every requested bin lies inside the unpadded shifted data.
-    nt = cand.data.shape[0]
-    time_range = None
-    if time_decimate_factor > 0 and args.time_size > 0:
-        decimated_nt = (nt + time_decimate_factor - 1) // time_decimate_factor
-        crop_start = decimated_nt // 2 - args.time_size // 2
-        crop_stop = crop_start + args.time_size
-        if (
-            crop_start >= 0
-            and (crop_stop < decimated_nt or args.time_size == decimated_nt)
-            and crop_stop * time_decimate_factor <= nt
-        ):
-            time_range = (
-                crop_start * time_decimate_factor,
-                crop_stop * time_decimate_factor,
-            )
-    # ponytail: crops needing median padding retain the full-array path;
-    # add bounded median handling only if those cases dominate real workloads.
-    cand.dmtime(time_range=time_range)
-    logger.info("Made DMT")
+def cpu_dedisp_dmt(cand, args, profile=None):
     if args.opt_dm:
-        logger.info("Optimising DM")
-        logger.warning("This feature is experimental!")
+        cand.get_chunk(for_preprocessing=True)
         cand.optimize_dm()
-    else:
-        cand.dm_opt = -1
-        cand.snr_opt = -1
-    cand.dedisperse(time_range=time_range)
-    logger.info("Made Dedispersed profile")
-
-    # Frequency - Time reshaping
-    if time_decimate_factor != 1:
-        cand.decimate(
-            key="ft",
-            axis=0,
-            pad=True,
-            decimate_factor=time_decimate_factor,
-            mode="median",
-        )
-    if time_range is None:
-        crop_start_sample_ft = cand.dedispersed.shape[0] // 2 - args.time_size // 2
-        cand.dedispersed = crop(
-            cand.dedispersed, crop_start_sample_ft, args.time_size, 0
-        )
-    logger.info(f"Decimated Time axis of FT to tsize: {cand.dedispersed.shape[0]}")
-    # DM-time reshaping
-    if time_decimate_factor != 1:
-        cand.decimate(
-            key="dmt",
-            axis=1,
-            pad=True,
-            decimate_factor=time_decimate_factor,
-            mode="median",
-        )
-    if time_range is None:
-        crop_start_sample_dmt = cand.dmt.shape[1] // 2 - args.time_size // 2
-        cand.dmt = crop(cand.dmt, crop_start_sample_dmt, args.time_size, 1)
-    logger.info(
-        f"Decimated DM-Time to dmsize: {cand.dmt.shape[0]} and tsize: {cand.dmt.shape[1]}"
+    return cand.make_products(
+        target="CPU",
+        time_size=args.time_size,
+        frequency_size=args.frequency_size,
+        dmsteps=args.dmsteps,
+        output_dtype=args.output_dtype,
+        profile=profile,
     )
-    return cand
 
 
 def _input_files(filename, num_files):
+    filename = os.path.realpath(os.fspath(filename))
     fname, ext = os.path.splitext(filename)
     if ext == ".fits" or ext == ".sf":
         if num_files == 1:
@@ -154,13 +101,14 @@ def cand2h5(cand_val):
 
 
 def _cand2h5(cand_val, *, candidate=None, files=None):
-    """
-    TODO: Add option to use cand.resize for reshaping FT and DMT
-    Generates h5 file of candidate with resized frequency-time and DM-time arrays
-    :param cand_val: List of candidate parameters (filename, snr, width, dm, label, tcand(s))
-    :type cand_val: Candidate
-    :return: None
-    """
+    """Write one finished candidate and return its timing report."""
+    started = perf_counter()
+    profile = {}
+    if len(cand_val) not in (10, 11):
+        raise ValueError(
+            "candidate input must contain 10 fields and optional row index"
+        )
+    row_index = int(cand_val[10]) if len(cand_val) == 11 else None
     (
         filename,
         snr,
@@ -172,7 +120,7 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         num_files,
         args,
         gpu_id,
-    ) = cand_val
+    ) = cand_val[:10]
     if os.path.exists(str(kill_mask_path)):
         logger.info(f"Using mask {kill_mask_path}")
         kill_chans = np.loadtxt(kill_mask_path, dtype=np.int32)
@@ -202,43 +150,48 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
     if os.path.exists(str(kill_mask_path)):
         kill_mask = np.zeros(cand.nchans, dtype=np.bool_)
         kill_mask[kill_chans] = True
-        cand.kill_mask = kill_mask
-    cand.get_chunk(for_preprocessing=True)
-    if cand.format == "fil":
-        cand.fp.close()
-
-    logger.info("Got Chunk")
-
-    if gpu_id >= 0:
-        logger.debug(f"Using the GPU {gpu_id}")
-        try:
-            cand = gpu_dedisp_and_dmt_crop(cand, device=gpu_id)
-        except CudaAPIError:
-            logger.info(
-                "Ran into a CudaAPIError, using the CPU version for this candidate"
+        cand._reset_candidate(**candidate_kwargs, kill_mask=kill_mask)
+    try:
+        if gpu_id >= 0:
+            if args.opt_dm:
+                raise ValueError("DM optimization is available only on the CPU path")
+            cand.make_products(
+                target="GPU",
+                time_size=args.time_size,
+                frequency_size=args.frequency_size,
+                dmsteps=args.dmsteps,
+                output_dtype=args.output_dtype,
+                profile=profile,
             )
-            cand = cpu_dedisp_dmt(cand, args)
-    else:
-        cand = cpu_dedisp_dmt(cand, args)
-
-    cand.resize(
-        key="ft", size=args.frequency_size, axis=1, anti_aliasing=True, mode="constant"
-    )
-    logger.info(f"Resized Frequency axis of FT to fsize: {cand.dedispersed.shape[1]}")
-    cand.dmt = normalise(cand.dmt)
-    cand.dedispersed = normalise(cand.dedispersed)
-    fout = cand.save_h5(out_dir=args.fout)
-    logger.debug(f"Filesize of {fout} is {os.path.getsize(fout)}")
-    if not os.path.isfile(fout):
-        raise IOError(f"File with {cand.id} not written")
-    if os.path.getsize(fout) < 100 * 1024:
-        raise ValueError(f"File with id: {cand.id} has issues! Its size is too less.")
+        else:
+            cpu_dedisp_dmt(cand, args, profile=profile)
+        save_start = perf_counter()
+        output_filename = None if row_index is None else f"{cand.id}_{row_index}.h5"
+        if output_filename is None:
+            fout = cand.save_h5(out_dir=args.fout)
+        else:
+            fout = cand.save_h5(out_dir=args.fout, fnout=output_filename)
+        profile["save_s"] = perf_counter() - save_start
+        with __import__("h5py").File(fout, "r") as output:
+            expected = {
+                "data_freq_time": (args.time_size, args.frequency_size),
+                "data_dm_time": (args.dmsteps, args.time_size),
+            }
+            for name, shape in expected.items():
+                if output[name].shape != shape or output[name].dtype != np.dtype(
+                    args.output_dtype
+                ):
+                    raise ValueError(f"Invalid candidate dataset {name} in {fout}")
+    finally:
+        if candidate is None:
+            cand.close()
     logger.info(fout)
     if candidate is None:
         del cand
     else:
         cand.data = cand.dedispersed = cand.dmt = None
-    return None
+    profile["total_s"] = perf_counter() - started
+    return {"output_file": fout, "device": gpu_id, "profile": profile}
 
 
 def cached_cand2h5(cand_val):
@@ -268,18 +221,16 @@ if __name__ == "__main__":
         formatter_class=YourArgparseFormatter,
         epilog=textwrap.dedent(
             """\
-        `your_candmaker.py` can be used to make candidate cutout files. Some additional notes for this script: 
-        - These files are generated in HDF file format. 
-        - The output candidates have been preprocessed and consists of Dedispersed Frequency-Time and DM-Time information of the candidate. 
-        - The input should be a csv file containing the parameters of the candidates. The input csv file should contain the following fields: 
-                - file: Filterbank or PSRFITs file containing the data. In case of multiple files, this should contain the name of first file. 
-                - snr: Signal to Noise of the candidate.
-                - width: Width of candidate as log2(number of samples). 
-                - dm: DM of candidate
-                - label: Label of candidate (can be just set to 0, if not known)
-                - stime: Start time (seconds) of the candidate.
-                - chan_mask_path: Path of the channel mask file. 
-                - num_files: Number of files. 
+        Make fixed-size frequency-time and DM-time HDF5 candidate products.
+        The CSV fields are:
+            file: Filterbank or first PSRFITS filename.
+            snr: Candidate signal-to-noise ratio.
+            width: log2(pulse width in native samples).
+            dm: Candidate dispersion measure.
+            label: Candidate label, or zero if unknown.
+            stime: Arrival time in seconds at the highest-frequency channel.
+            chan_mask_path: Channel mask filename, or empty.
+            num_files: Number of files in the observation.
             """
         ),
     )
@@ -294,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-g",
         "--gpu_id",
-        help="GPU ID (use -1 for CPU). To use multiple GPUs (say with id 2 and 3 use -g 2 3",
+        help="GPU IDs, for example -g 2 3; use -1 alone for CPU",
         nargs="+",
         required=False,
         default=[-1],
@@ -364,9 +315,36 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument(
+        "--dmsteps",
+        type=int,
+        default=256,
+        help="Number of DM trials spanning zero to twice candidate DM",
+    )
+    parser.add_argument(
+        "--output_dtype", choices=("float16", "float32"), default="float16"
+    )
+    parser.add_argument(
+        "--gpu_memory_mb",
+        type=int,
+        default=None,
+        help="Bound GPU working memory in MiB (default: available memory budget)",
+    )
+    parser.add_argument(
+        "--gpu_inflight",
+        type=int,
+        default=2,
+        help="Maximum simultaneous candidates per GPU",
+    )
+    parser.add_argument(
+        "--profile_json",
+        default=None,
+        help="Write GPU stage timings and I/O counters as JSON",
+    )
+    parser.add_argument(
         "--no_log_file", help="Do not write a log file", action="store_true"
     )
     values = parser.parse_args()
+    os.makedirs(values.fout, exist_ok=True)
 
     logging_format = (
         "%(asctime)s - %(funcName)s -%(name)s - %(levelname)s - %(message)s"
@@ -406,43 +384,136 @@ if __name__ == "__main__":
     for arg, value in sorted(vars(values).items()):
         logging.info("%s: %r", arg, value)
 
-    if -1 not in values.gpu_id:
-        from numba.cuda.cudadrv.driver import CudaAPIError
-
-        for gpu_ids in values.gpu_id:
-            logger.info(f"Using the GPU {gpu_ids}")
-        if len(values.gpu_id) > 1:
-            from itertools import cycle
-
-            gpu_id_cycler = cycle(range(len(values.gpu_id)))
-    else:
-        logger.info("Using CPUs only")
-
+    if any(gpu < -1 for gpu in values.gpu_id) or (
+        -1 in values.gpu_id and len(values.gpu_id) > 1
+    ):
+        parser.error("use -1 alone for CPU, or one or more nonnegative GPU IDs")
+    if len(set(values.gpu_id)) != len(values.gpu_id):
+        parser.error("GPU IDs must be unique")
+    if (
+        min(
+            values.time_size,
+            values.frequency_size,
+            values.dmsteps,
+            values.gpu_inflight,
+            values.nproc,
+        )
+        < 1
+    ):
+        parser.error(
+            "output dimensions, dmsteps, gpu_inflight, and nproc must be positive"
+        )
+    if values.gpu_memory_mb is not None and values.gpu_memory_mb <= 0:
+        parser.error("gpu_memory_mb must be positive")
+    if values.opt_dm and values.gpu_id != [-1]:
+        parser.error("DM optimization is available only on CPU")
+    os.makedirs(values.fout, exist_ok=True)
     cand_pars = pd.read_csv(values.cand_param_file)
-    # Randomly shuffle the candidates, this is so that the high DM candidates are spread through out
-    # Else they will clog the GPU memory at once
-    cand_pars.sample(frac=1).reset_index(drop=True)
     process_list = []
-    for index, row in cand_pars.iterrows():
-        if len(values.gpu_id) > 1:
-            # If there are more than one GPUs cycle the candidates between them.
-            gpu_id = next(gpu_id_cycler)
-        else:
-            gpu_id = values.gpu_id[0]
+    for _, row in cand_pars.iterrows():
         process_list.append(
             [
                 row["file"],
                 row["snr"],
-                2 ** row["width"],
+                2 ** int(row["width"]),
                 row["dm"],
                 row["label"],
                 row["stime"],
                 row["chan_mask_path"],
-                row["num_files"],
+                int(row["num_files"]),
                 values,
-                gpu_id,
+                values.gpu_id[0],
             ]
         )
 
-    with Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
-        pool.map(cached_cand2h5, process_list, chunksize=1)
+    if values.gpu_id == [-1]:
+        with Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
+            cpu_process_list = [
+                [*item, index] for index, item in enumerate(process_list)
+            ]
+            reports = pool.map(cached_cand2h5, cpu_process_list, chunksize=1)
+        if values.profile_json:
+            import json
+            from pathlib import Path
+
+            Path(values.profile_json).write_text(json.dumps(reports, indent=2))
+    else:
+        jobs = []
+        rows_by_files = {}
+        for i, item in enumerate(process_list):
+            filename, nfiles = item[0], item[7]
+            files = tuple(_input_files(filename, nfiles))
+            rows_by_files.setdefault(files, []).append((i, item))
+
+        output_names = set()
+        for files, rows in rows_by_files.items():
+            reader = Candidate(list(files), dm=rows[0][1][3])
+            try:
+                for i, item in rows:
+                    (
+                        filename,
+                        snr,
+                        width,
+                        dm,
+                        label,
+                        tcand,
+                        mask_path,
+                        nfiles,
+                        _,
+                        _,
+                    ) = item
+                    kwargs = dict(
+                        dm=dm,
+                        snr=snr,
+                        width=width,
+                        label=label,
+                        tcand=tcand,
+                        flag_rfi=values.flag_rfi,
+                        spectral_kurtosis_sigma=values.spectral_kurtosis_sigma,
+                        savgol_frequency_window=values.savgol_frequency_window,
+                        savgol_sigma=values.savgol_sigma,
+                    )
+                    if os.path.exists(str(mask_path)):
+                        mask = np.zeros(reader.nchans, dtype=bool)
+                        mask[np.atleast_1d(np.loadtxt(mask_path, dtype=np.int32))] = (
+                            True
+                        )
+                        kwargs["kill_mask"] = mask
+                    reader._reset_candidate(**kwargs)
+
+                    output_filename = f"{reader.id}.h5"
+                    if output_filename in output_names:
+                        output_filename = f"{reader.id}_{i}.h5"
+                    suffix = 1
+                    while output_filename in output_names:
+                        output_filename = f"{reader.id}_{i}_{suffix}.h5"
+                        suffix += 1
+
+                    full_plan = make_plan(
+                        reader,
+                        values.time_size,
+                        values.frequency_size,
+                        values.dmsteps,
+                        values.output_dtype,
+                    )
+                    plan = CompactCandidatePlan.from_plan(full_plan)
+                    del full_plan
+                    jobs.append(CandidateJob(files, kwargs, plan, i, output_filename))
+                    output_names.add(output_filename)
+            finally:
+                reader.close()
+        budget = (
+            None if values.gpu_memory_mb is None else values.gpu_memory_mb * 1024**2
+        )
+        reports = run_jobs(
+            jobs,
+            gpu_ids=values.gpu_id,
+            output_dir=values.fout,
+            memory_budget_bytes=budget,
+            max_inflight=values.gpu_inflight,
+        )
+        if values.profile_json:
+            import json
+            from pathlib import Path
+
+            Path(values.profile_json).write_text(json.dumps(reports, indent=2))

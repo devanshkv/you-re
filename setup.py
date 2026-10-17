@@ -21,7 +21,7 @@ setup(
     packages=find_packages(),
     url="https://github.com/thepetabyteproject/your",
     author="Devansh Agarwal, Kshitij Aggarwal",
-    scripts=glob.glob("bin/*"),
+    scripts=glob.glob("bin/*.py"),
     rust_extensions=[
         RustExtension(
             "your._rust",
@@ -31,7 +31,11 @@ setup(
             args=["--locked"],
         )
     ],
-    extras_require={"test": ["pytest", "pytest-cov"]},
+    extras_require={
+        "test": ["pytest", "pytest-cov"],
+        "gpu": ["cupy-cuda12x>=13.6,<14"],
+    },
+    package_data={"your.utils": ["*.cu"]},
     install_requires=required,
     long_description=long_description,
     long_description_content_type="text/markdown",

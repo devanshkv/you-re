@@ -1,3 +1,4 @@
 include *.md LICENSE requirements.txt 
 include rust/Cargo.toml rust/Cargo.lock
 recursive-include rust/src *.rs
+recursive-include your/utils *.cu

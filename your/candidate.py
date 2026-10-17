@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 
+import hashlib
+import json
+import logging
+import os
+from contextlib import contextmanager
 from operator import index
+from tempfile import NamedTemporaryFile
 
 import h5py
 import numpy as np
@@ -9,10 +15,9 @@ from scipy.optimize import golden
 from your import Your
 from your._rust import dedisperse as _rust_dedisperse
 from your._rust import dedispersets as _rust_dedispersets
-from your._rust import dmtime as _rust_dmtime
 from your.utils.gpu import gpu_dedisperse, gpu_dmt
-from your.utils.misc import *
 from your.utils.misc import _decimate, _resize
+from your.utils.misc import crop as crop
 from your.utils.rfi import sk_sg_filter
 
 _RUST_DEDISPERSETS_DTYPES = {
@@ -36,18 +41,21 @@ def _time_bounds(nt, time_range):
     return start, stop
 
 
-def _dedispersed_channel(column, delay, start, stop):
-    """Slice the existing circular-shift convention without a full-channel copy."""
-    nt = len(column)
-    if start == stop:
-        return column[:0]
-    # Delays outside the input length are identity shifts in the original slices.
-    pivot = -int(delay) if -nt < delay < nt else 0
-    source = (start + pivot) % nt
-    count = min(stop - start, nt - source)
-    return np.concatenate(
-        (column[source : source + count], column[: stop - start - count])
-    )
+@contextmanager
+def _atomic_h5(filename):
+    """Publish a complete HDF5 file, preserving an existing file on failure."""
+    filename = os.path.abspath(os.fspath(filename))
+    with NamedTemporaryFile(
+        prefix=".candidate-", suffix=".h5", dir=os.path.dirname(filename), delete=False
+    ) as temporary:
+        staging = temporary.name
+    try:
+        with h5py.File(staging, "w") as handle:
+            yield handle
+        os.replace(staging, filename)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
 
 
 class Candidate(Your):
@@ -55,9 +63,9 @@ class Candidate(Your):
     Candidate Class
 
     Args:
-        fp Union[str, list]: String or a list of files. It can either filterbank or psrfits files.
+        fp Union[str, list]: Filterbank or PSRFITS filename or list of filenames.
         dm (float): Dispersion Measure of the candidate
-        tcand (float): start time of the candidate in seconds at the highest frequency channel
+        tcand (float): Arrival time in seconds at the highest-frequency channel.
         width (int): pulse width of the candidate in samples
         label (int): 1 for pulsars/FRBs, 0 for RFI
         snr (float): Signal to Noise Ratio
@@ -130,7 +138,6 @@ class Candidate(Your):
         self.width = width
         self.label = label
         self.snr = snr
-        self.id = f"cand_tstart_{self.tstart:.12f}_tcand_{self.tcand:.7f}_dm_{self.dm:.5f}_snr_{self.snr:.5f}"
         self.data = None
         self.dedispersed = None
         self.dmt = None
@@ -144,6 +151,10 @@ class Candidate(Your):
         self.savgol_sigma = savgol_sigma
         self.flag_rfi = flag_rfi
         self.rfi_mask = np.array([False])
+        self.processing_metadata = {}
+        self._chunk_start = None
+        self._chunk_shape = None
+        self._update_id()
         logger.debug(
             f"Initiated a cand object with "
             f"dm: {self.dm}, "
@@ -152,6 +163,32 @@ class Candidate(Your):
             f"tcand: {self.tcand}"
         )
         return self
+
+    def _update_id(self):
+        """Refresh the output identity from the current candidate parameters."""
+        identity = (
+            tuple(os.path.realpath(name) for name in self.your_header.filelist),
+            float(self.tstart),
+            float(self.tcand),
+            float(self.dm),
+            float(self.snr),
+            int(self.width),
+            int(self.label),
+            int(self.min_samp),
+            np.asarray(self.kill_mask).tolist(),
+            bool(self.flag_rfi),
+            float(self.spectral_kurtosis_sigma),
+            float(self.savgol_frequency_window),
+            float(self.savgol_sigma),
+        )
+        token = hashlib.blake2b(
+            json.dumps(identity, separators=(",", ":")).encode(), digest_size=12
+        ).hexdigest()
+        self.id = (
+            f"cand_tstart_{self.tstart:.12f}_tcand_{self.tcand:.7f}"
+            f"_dm_{self.dm:.5f}_snr_{self.snr:.5f}_{token}"
+        )
+        return self.id
 
     def save_h5(self, out_dir=None, fnout=None):
         """
@@ -165,15 +202,14 @@ class Candidate(Your):
             str: output name of the file
 
         """
-        cand_id = self.id
+        cand_id = self._update_id()
         if fnout is None:
             fnout = cand_id + ".h5"
+        fnout = os.fspath(fnout)
         if out_dir is not None:
-            if out_dir[-1] != "/":
-                out_dir = out_dir + "/"
-            fnout = out_dir + fnout
+            fnout = os.path.join(os.fspath(out_dir), fnout)
         logger.info(f"Saving h5 file {fnout}.")
-        with h5py.File(fnout, "w") as f:
+        with _atomic_h5(fnout) as f:
             f.attrs["cand_id"] = cand_id
             f.attrs["tcand"] = self.tcand
             f.attrs["dm"] = self.dm
@@ -196,9 +232,12 @@ class Candidate(Your):
                     f.attrs[key] = file_header[key]
 
             f.attrs["tsamp"] = self.your_header.tsamp
-            f.attrs["nchans"] = self.your_header.nchans
+            f.attrs["nchans"] = self.dedispersed.shape[1]
             f.attrs["foff"] = self.your_header.foff
             f.attrs["nspectra"] = self.your_header.nspectra
+
+            for key, value in self.processing_metadata.items():
+                f.attrs[key] = value
 
             freq_time_dset = f.create_dataset(
                 "data_freq_time",
@@ -250,8 +289,8 @@ class Candidate(Your):
         Args:
             tstart (float): start time of the chunk in seconds
             tstop (float): stop time of the chunk in seconds
-            for_preprocessing (bool): if the data is to be preprocessed later. This will modify the number of samples
-            read based on the width of the candidate
+            for_preprocessing (bool): Extend the read according to candidate width
+                when the data will be preprocessed later.
 
         """
         if tstart is None:
@@ -343,6 +382,8 @@ class Candidate(Your):
             data[: nspectra - nstart_read, :] = d
 
         self.data = data.astype(self.your_header.dtype)
+        self._chunk_start = nstart_read
+        self._chunk_shape = self.data.shape
 
         if self.kill_mask.any():
             logger.info("Applying the kill mask")
@@ -364,153 +405,221 @@ class Candidate(Your):
             np.copyto(self.data, 0, where=self.rfi_mask[None, :])
         return self
 
-    def dedisperse(self, dms=None, target="CPU", *, time_range=None):
-        """
-        Dedisperse a chunk of data. Saves the dedispersed chunk in `self.dedispersed`.
-
-        Note:
-            Our method rolls the data around while dedispersing it.
-
-        Args:
-            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
-            dms (float): The DM to dedisperse the data at.
-            target (str): 'CPU' to run the code on the CPU or 'GPU' to run it on a GPU.
-
-        """
-
-        if time_range is not None and target != "CPU":
-            raise ValueError("time_range is supported only on CPU")
-        if dms is None:
-            dms = self.dm
-        if self.data is not None:
-            if target == "CPU":
-                nt, nf = self.data.shape
-                assert nf == len(self.chan_freqs)
-                delay_time = (
-                    4148808.0
-                    * dms
-                    * (1 / (self.chan_freqs[0]) ** 2 - 1 / (self.chan_freqs) ** 2)
-                    / 1000
+    def set_processed_products(self, plan, ft, dmt):
+        """Attach finished candidate images and their sampling/processing metadata."""
+        for product, shape in (
+            (ft, (plan.time_size, plan.frequency_size)),
+            (dmt, (plan.dmsteps, plan.time_size)),
+        ):
+            if product.shape != shape or product.dtype != plan.output_dtype:
+                raise ValueError(
+                    "finished candidate product has unexpected shape or dtype"
                 )
-                delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
-                start, stop = _time_bounds(nt, time_range)
-                if (
-                    type(self.data) is np.ndarray
-                    and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
-                    # Retain NumPy's float64-to-float32 warning/error policy.
-                    and self.data.dtype != np.float64
-                    and self.data.flags.aligned
-                    and self.data.flags.c_contiguous
-                    # Long, narrow outputs can be faster with NumPy column copies.
-                    and (stop - start <= 1024 or nf >= 512)
-                ):
-                    self.dedispersed = _rust_dedisperse(
-                        self.data, delay_bins, start, stop
-                    )
-                else:
-                    self.dedispersed = np.empty((stop - start, nf), dtype=np.float32)
-                    for ii in range(nf):
-                        self.dedispersed[:, ii] = _dedispersed_channel(
-                            self.data[:, ii], delay_bins[ii], start, stop
+            if not np.isfinite(product).all():
+                raise ValueError("finished candidate products must be finite")
+        self.dedispersed, self.dmt = ft, dmt
+        self.processing_metadata = {
+            "candidate_processing_version": 1,
+            "ft_detrended": True,
+            "products_normalized": True,
+            "output_dtype": np.dtype(ft.dtype).name,
+            "time_bin": plan.time_bin,
+            "native_tsamp": plan.native_tsamp,
+            "tsamp": plan.native_tsamp * plan.time_bin,
+            "output_start_sample": plan.output_start,
+            "input_start_sample": plan.required_start,
+            "input_stop_sample": plan.required_stop,
+            "padding_before": plan.pad_before,
+            "padding_after": plan.pad_after,
+            "time_reference": "highest_frequency",
+            "dm_time_reduction": "channel_mean",
+            "input_nchans": self.your_header.nchans,
+            "foff": self.your_header.foff
+            * self.your_header.nchans
+            / plan.frequency_size,
+            "dm_trials": plan.dm_values,
+        }
+        return self
+
+    def make_products(
+        self,
+        *,
+        target="CPU",
+        time_size=256,
+        frequency_size=256,
+        dmsteps=256,
+        output_dtype="float16",
+        profile=None,
+    ):
+        """Produce fixed-size, non-circular, detrended candidate products."""
+        from your.utils.candidate_pipeline import make_plan, process_cpu
+
+        self._update_id()
+        plan = make_plan(self, time_size, frequency_size, dmsteps, output_dtype)
+        if target == "CPU":
+            ft, dmt = process_cpu(self, plan, profile=profile)
+        elif target == "GPU":
+            from your.utils.candidate_pipeline import read_plan_data
+            from your.utils.gpu import _cupy, estimate_process_gpu_bytes, process_gpu
+            from your.utils.gpu_streaming import process_gpu_streaming
+
+            cp = _cupy()
+            with cp.cuda.Device(self.device):
+                free, _ = cp.cuda.runtime.memGetInfo()
+                budget = int(free * 0.8)
+                streaming = (
+                    estimate_process_gpu_bytes(plan, self.your_header.dtype) > budget
+                )
+                if not streaming:
+                    data = read_plan_data(self, plan)
+                    try:
+                        ft, dmt = process_gpu(
+                            self, plan, data=data, device=self.device, profile=profile
                         )
-            elif target == "GPU":
-                gpu_dedisperse(self, device=self.device)
+                    except MemoryError as error:
+                        error.__traceback__ = None
+                        streaming = True
+                if streaming:
+                    cp.get_default_memory_pool().free_all_blocks()
+                    ft, dmt = process_gpu_streaming(
+                        self,
+                        plan,
+                        memory_budget_bytes=budget,
+                        device=self.device,
+                        profile=profile,
+                    )
         else:
+            raise ValueError("target must be 'CPU' or 'GPU'")
+        return self.set_processed_products(plan, ft, dmt)
+
+    def _direct_input(self, dm_values, start, stop):
+        """Read real halo samples; preserve edits to the already loaded chunk."""
+        frequencies = np.asarray(self.chan_freqs, dtype=np.float64)
+        if len(frequencies) != self.data.shape[1] or np.any(frequencies <= 0):
+            raise ValueError("expected one positive frequency per input channel")
+        dms = np.asarray(dm_values, dtype=np.float64)
+        if not np.all(np.isfinite(dms)) or not np.all(np.isfinite(frequencies)):
+            raise ValueError("DMs and frequencies must be finite")
+        delays = np.rint(
+            (4148808.0 * dms[:, None])
+            * (1 / frequencies[None, :] ** 2 - 1 / frequencies.max() ** 2)
+            / 1000.0
+            / self.native_tsamp
+        ).astype(np.int64)
+        if not len(delays) or start == stop:
+            return self.data[:0], delays, start
+        low = start + int(delays.min())
+        high = stop + int(delays.max())
+        base = getattr(self, "_chunk_start", None)
+        from_file = base is not None and self.data.shape == self._chunk_shape
+        if from_file:
+            total = int(self.your_header.nspectra)
+            origin = min(total, max(0, base + low)) - base
+            end = min(total, max(base + origin, base + high)) - base
+            if end > origin:
+                source = np.array(self.get_data(base + origin, end - origin), copy=True)
+            else:
+                source = np.empty((0, self.data.shape[1]), dtype=self.data.dtype)
+        else:
+            origin = max(0, min(len(self.data), low))
+            end = max(origin, min(len(self.data), high))
+            source = np.array(self.data[origin:end], copy=True)
+        lo, hi = max(origin, 0), min(end, len(self.data))
+        if hi > lo:
+            source[lo - origin : hi - origin] = self.data[lo:hi]
+        # Apply the same masks to preserved edits and newly read halo samples.
+        from your.utils.candidate_contract import parse_kill_mask
+
+        source[:, parse_kill_mask(getattr(self, "kill_mask", []), source.shape[1])] = 0
+        rfi_mask = np.asarray(getattr(self, "rfi_mask", []))
+        if rfi_mask.dtype.kind == "b" and rfi_mask.shape == (source.shape[1],):
+            source[:, rfi_mask] = 0
+        return source, delays, origin
+
+    def _direct_cpu(self, dm_values, start, stop, *, keep_channels=False):
+        source, delays, origin = self._direct_input(dm_values, start, stop)
+        nf = self.data.shape[1]
+        from your.utils.candidate_pipeline import _channel_medians
+
+        fill = _channel_medians(source, nf).astype(np.float32)
+        if source.dtype.kind == "f" and not np.all(np.isfinite(source)):
+            source = np.where(np.isfinite(source), source, fill[None, :])
+        shape = (stop - start, nf) if keep_channels else (len(delays), stop - start)
+        output = np.zeros(shape, dtype=np.float32)
+        times = np.arange(start, stop, dtype=np.int64)
+        fully_covered = (
+            len(delays) > 0
+            and stop > start
+            and source.dtype in _RUST_DEDISPERSETS_DTYPES
+            and source.dtype != np.float64
+            and start + int(delays.min()) >= origin
+            and stop + int(delays.max()) <= origin + len(source)
+        )
+        if fully_covered:
+            if keep_channels:
+                return _rust_dedisperse(
+                    source, -delays[0], start - origin, stop - origin
+                )
+            for row, offsets in enumerate(delays):
+                output[row] = _rust_dedispersets(
+                    source, -offsets, start - origin, stop - origin
+                )
+            return output / nf
+        for row, offsets in enumerate(delays):
+            for channel, offset in enumerate(offsets):
+                indices = times + offset - origin
+                valid = (indices >= 0) & (indices < len(source))
+                values = np.full(stop - start, fill[channel], dtype=np.float32)
+                values[valid] = source[indices[valid], channel]
+                if keep_channels:
+                    output[:, channel] = values
+                else:
+                    output[row] += values
+        return output if keep_channels else output / nf
+
+    def dedisperse(self, dms=None, target="CPU", *, time_range=None):
+        """Dedisperse without wrapping; load real file halo when available."""
+        if self.data is None:
             logger.warning("No data in self.data, run self.get_chunk() first")
             self.dedispersed = None
+            return self
+        start, stop = _time_bounds(len(self.data), time_range)
+        dm = self.dm if dms is None else dms
+        if target == "CPU":
+            self.dedispersed = self._direct_cpu([dm], start, stop, keep_channels=True)
+        elif target == "GPU":
+            gpu_dedisperse(self, device=self.device, dms=dm, time_range=time_range)
+        else:
+            raise ValueError("target must be 'CPU' or 'GPU'")
         return self
 
     def dedispersets(self, dms=None, *, time_range=None):
-        """
-        Create a dedispersed time series
-
-        Note:
-            Our method rolls the data around while dedispersing it.
-
-        Args:
-            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
-            dms (float): The DM to dedisperse the data at.
-
-        Returns:
-            numpy.ndarray: Dedispersed time series.
-
-        """
-        if dms is None:
-            dms = self.dm
-        if self.data is not None:
-            nt, nf = self.data.shape
-            assert nf == len(self.chan_freqs)
-            delay_time = (
-                4148808.0
-                * dms
-                * (1 / (self.chan_freqs[0]) ** 2 - 1 / (self.chan_freqs) ** 2)
-                / 1000
-            )
-            delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
-            start, stop = _time_bounds(nt, time_range)
-            if (
-                type(self.data) is np.ndarray
-                and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
-                and self.data.flags.aligned
-            ):
-                return _rust_dedispersets(self.data, delay_bins, start, stop)
-            ts = np.zeros(stop - start, dtype=np.float32)
-            for ii in range(nf):
-                ts += _dedispersed_channel(
-                    self.data[:, ii], delay_bins[ii], start, stop
-                )
-            return ts
+        """Return the channel-summed, non-circular dedispersed time series."""
+        if self.data is None:
+            return None
+        start, stop = _time_bounds(len(self.data), time_range)
+        ft = self._direct_cpu(
+            [self.dm if dms is None else dms], start, stop, keep_channels=True
+        )
+        return ft.sum(axis=1, dtype=np.float32)
 
     def dmtime(self, dmsteps=256, target="CPU", *, time_range=None):
-        """
-        Generates DM-time array of the candidate by dedispersing at adjacent DM values. Saves the data in `self.dmt`.
-
-        Note:
-            Our method rolls the data around while dedispersing it.
-
-        Args:
-            time_range (tuple): Optional (start, stop) samples in the full shifted output, before decimation. CPU only.
-            dmsteps (int): Number of DMs to dedisperse at.
-            target (str): 'CPU' to run the code on the CPU or 'GPU' to run it on a GPU.
-
-        """
-        if time_range is not None and target != "CPU":
-            raise ValueError("time_range is supported only on CPU")
+        """Return channel-averaged DM trials from zero to twice the candidate DM."""
+        dmsteps = index(dmsteps)
+        if dmsteps < 1:
+            raise ValueError("dmsteps must be positive")
+        if self.data is None:
+            self.dmt = None
+            return self
+        start, stop = _time_bounds(len(self.data), time_range)
         if target == "CPU":
-            range_dm = self.dm
-            dm_list = self.dm + np.linspace(-range_dm, range_dm, dmsteps)
-            start, stop = _time_bounds(self.data.shape[0], time_range)
-            if (
-                type(self) is Candidate
-                and type(self.data) is np.ndarray
-                and self.data.dtype in _RUST_DEDISPERSETS_DTYPES
-                and self.data.flags.aligned
-                and (
-                    stop - start <= 1024
-                    # Keep small or sparse wide batches on the scalar path;
-                    # packing's full-input pass needs enough repeated DM work.
-                    or (
-                        self.data.flags.c_contiguous
-                        and len(dm_list) >= 32
-                        and 16 * self.data.shape[0] <= len(dm_list) * (stop - start)
-                    )
-                )
-                and getattr(self.dedispersets, "__func__", None)
-                is Candidate.dedispersets
-                and len(dm_list)
-            ):
-                freqs = self.chan_freqs
-                assert self.data.shape[1] == len(freqs)
-                frequency_term = 1 / freqs[0] ** 2 - 1 / freqs**2
-                self.dmt = _rust_dmtime(
-                    self.data, dm_list, frequency_term, self.native_tsamp, start, stop
-                )
-            else:
-                self.dmt = np.empty((dmsteps, stop - start), dtype=np.float32)
-                for ii, dm in enumerate(dm_list):
-                    self.dmt[ii, :] = self.dedispersets(dms=dm, time_range=time_range)
+            self.dmt = self._direct_cpu(
+                np.linspace(0, 2 * self.dm, dmsteps), start, stop
+            )
         elif target == "GPU":
-            gpu_dmt(self, device=self.device)
+            gpu_dmt(self, device=self.device, dmsteps=dmsteps, time_range=time_range)
+        else:
+            raise ValueError("target must be 'CPU' or 'GPU'")
         return self
 
     def get_snr(self, time_series=None):
@@ -538,7 +647,7 @@ class Candidate(Your):
 
     def optimize_dm(self):
         """
-        Calculate more precise value of the DM by interpolating between DM values to maximise the SNR
+        Interpolate between DM values to maximize SNR.
 
         Note:
             This function has not been fully tested.
@@ -582,22 +691,20 @@ class Candidate(Your):
         """
         if key == "dmt":
             logger.debug(
-                f"Decimating dmt along axis {axis}, with factor {decimate_factor},  pre-decimation shape: {self.dmt.shape}"
+                f"Decimating dmt axis {axis}, factor {decimate_factor}, "
+                f"shape: {self.dmt.shape}"
             )
             self.dmt = _decimate(self.dmt, decimate_factor, axis, pad, **kwargs)
-            logger.debug(
-                f"Decimated dmt along axis {axis}, post-decimation shape: {self.dmt.shape}"
-            )
+            logger.debug(f"Decimated dmt axis {axis}, shape: {self.dmt.shape}")
         elif key == "ft":
             logger.debug(
-                f"Decimating ft along axis {axis}, with factor {decimate_factor}, pre-decimation shape: {self.dedispersed.shape}"
+                f"Decimating ft axis {axis}, factor {decimate_factor}, "
+                f"shape: {self.dedispersed.shape}"
             )
             self.dedispersed = _decimate(
                 self.dedispersed, decimate_factor, axis, pad, **kwargs
             )
-            logger.debug(
-                f"Decimated ft along axis {axis}, post-decimation shape: {self.dedispersed.shape}"
-            )
+            logger.debug(f"Decimated ft axis {axis}, shape: {self.dedispersed.shape}")
         else:
             raise AttributeError(
                 'Key can either be "dmt": DM-Time or "ft": Frequency-Time'

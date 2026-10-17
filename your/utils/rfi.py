@@ -81,6 +81,8 @@ def spectral_kurtosis(data, N=1, d=None):
             return ((M * d * N) + 1) * ((M * S2 / (S1**2)) - 1) / (M - 1)
 
     zero_mask = data == 0
+    if np.all(zero_mask):
+        return np.full(data.shape[1:], np.nan)
     if type(data) is np.ndarray and data.dtype.kind in "iu" and data.ndim in (1, 2):
         count = data.size - np.count_nonzero(zero_mask)
     else:
@@ -108,6 +110,19 @@ def spectral_kurtosis(data, N=1, d=None):
     return ((M * d * N) + 1) * ((M * S2 / (S1**2)) - 1) / (M - 1)
 
 
+def sk_rejection_mask(sk, sigma):
+    """Apply the existing SK median/MAD threshold, preserving masked inputs."""
+    if not np.any(np.isfinite(np.ma.filled(sk, np.nan))):
+        return np.ones(np.shape(sk), dtype=bool)
+    nan_mask = np.isnan(sk)
+    sk[nan_mask] = np.nan
+    sk_c = sk[~nan_mask]
+    std = 1.4826 * stats.median_abs_deviation(sk_c)
+    h = np.median(sk_c) + sigma * std
+    l = np.median(sk_c) - sigma * std
+    return ~((sk < h) & (sk > l))
+
+
 def sk_filter(data, channel_bandwidth, tsamp, N=None, d=None, sigma=5):
     """
     Apply Spectral Kurtosis filter to the data
@@ -127,14 +142,7 @@ def sk_filter(data, channel_bandwidth, tsamp, N=None, d=None, sigma=5):
     if not N:
         N = calc_N(channel_bandwidth, tsamp)
     sk = spectral_kurtosis(data, d=d, N=N)
-    nan_mask = np.isnan(sk)
-    sk[nan_mask] = np.nan
-    sk_c = sk[~nan_mask]
-    std = 1.4826 * stats.median_abs_deviation(sk_c)
-    h = np.median(sk_c) + sigma * std
-    l = np.median(sk_c) - sigma * std
-    mask = (sk < h) & (sk > l)
-    return ~mask
+    return sk_rejection_mask(sk, sigma)
 
 
 def calc_N(channel_bandwidth, tsamp):
@@ -214,6 +222,8 @@ def sk_sg_filter(
         raise ValueError("spectral_kurtosis_sigma can't be negative")
 
     if savgol_sigma > 0:
+        if not np.any(~sk_mask):
+            return mask
         bp = data.sum(0)[~sk_mask]
         logger.debug(
             f"Applying savgol filter with frequency_window={savgol_frequency_window} and sigma={savgol_sigma}"

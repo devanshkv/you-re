@@ -81,6 +81,11 @@ MPLBACKEND=Agg uv run --no-project python -m pytest
 
 GPU tests are skipped automatically when CUDA is unavailable.
 
+For CuPy candidate processing on CUDA 12, install `pip install 'your[gpu]'`
+(or `pip install -e '.[test,gpu]'` from source). Candidate products default to FP16.
+See [candidate processing and profiling](docs/cupy-candidates.md) for the GPU
+scheduler, memory limits, processing semantics, and baseline benchmark commands.
+
 ## Candidate plots
 
 `your_h5plotter.py` saves JPEG images at quality 95 with no chroma subsampling

@@ -46,16 +46,21 @@ def plot_h5(
     if output_format not in ("png", "jpeg"):
         raise ValueError('output_format must be "png" or "jpeg"')
     with h5py.File(h5_file, "r") as f:
-        dm_time = np.array(f["data_dm_time"])
-        if detrend_ft:
-            freq_time = detrend(np.array(f["data_freq_time"])[:, ::-1].T)
-        else:
-            freq_time = np.array(f["data_freq_time"])[:, ::-1].T
+        processed = int(f.attrs.get("candidate_processing_version", 0)) >= 1
+        dm_time = np.asarray(f["data_dm_time"], dtype=np.float32)
+        freq_time = np.asarray(f["data_freq_time"], dtype=np.float32)[:, ::-1].T
+        if detrend_ft and not f.attrs.get("ft_detrended", False):
+            freq_time = detrend(freq_time)
         dm_time[dm_time != dm_time] = 0
         freq_time[freq_time != freq_time] = 0
-        freq_time -= np.median(freq_time)
-        freq_time /= np.std(freq_time)
-        fch1, foff, nchan, dm, cand_id, tsamp, dm_opt, snr, snr_opt, width = (
+        if not f.attrs.get("products_normalized", False):
+            freq_time -= np.median(freq_time)
+            scale = np.std(freq_time)
+            if scale > 0:
+                freq_time /= scale
+            else:
+                freq_time.fill(0)
+        fch1, foff, nchan, dm, _cand_id, tsamp, _dm_opt, _snr, _snr_opt, width = (
             f.attrs["fch1"],
             f.attrs["foff"],
             f.attrs["nchans"],
@@ -69,14 +74,14 @@ def plot_h5(
         )
         tlen = freq_time.shape[1]
         if tlen != 256:
-            logging.warning(
-                "Lengh of time axis is not 256. This data is probably not pre-processed."
-            )
-        l = np.linspace(-tlen // 2, tlen // 2, tlen)
-        if width > 1:
-            ts = l * tsamp * width * 1000 / 2
+            logging.warning("Time axis has %s bins; the legacy default is 256.", tlen)
+        time_offsets = np.linspace(-tlen // 2, tlen // 2, tlen)
+        if processed:
+            ts = (np.arange(tlen) - tlen // 2) * tsamp * 1000
+        elif width > 1:
+            ts = time_offsets * tsamp * width * 1000 / 2
         else:
-            ts = l * tsamp * 1000
+            ts = time_offsets * tsamp * 1000
 
         if mad_filter:
             freq_time = smad_plotter(freq_time, float(mad_filter))

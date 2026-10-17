@@ -8,7 +8,6 @@ import argparse
 import importlib.abc
 import sys
 import warnings
-from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -55,12 +54,6 @@ def candidate(module, data):
     obj.foff = -0.25
     obj.formatclass = SimpleNamespace(native_tsamp=lambda _: 0.001)
     return obj
-
-
-def outputs(obj):
-    obj.dedisperse()
-    obj.dmtime(dmsteps=5)
-    return obj.dedispersed, obj.dedispersets(), obj.dmt
 
 
 def direct_checks(native):
@@ -145,21 +138,156 @@ def direct_checks(native):
             raise AssertionError("unsupported dtype accepted")
 
 
+def direct_candidate_reference(data, frequencies, tsamp, dm_values, start, stop):
+    """Independent absolute-index reference for Candidate's non-circular API."""
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    dm_values = np.asarray(dm_values, dtype=np.float64)
+    delays = np.rint(
+        4148808.0
+        * dm_values[:, None]
+        * (1.0 / frequencies[None, :] ** 2 - 1.0 / frequencies.max() ** 2)
+        / 1000.0
+        / tsamp
+    ).astype(np.int64)
+    nt, nchans = stop - start, data.shape[1]
+    result = np.zeros((len(dm_values), nt), dtype=np.float32)
+    if not len(dm_values) or nt == 0:
+        return result, delays
+
+    source_start = max(0, start + int(delays.min()))
+    source_stop = min(len(data), stop + int(delays.max()))
+    coverage = data[source_start:source_stop]
+    fill = (
+        np.median(coverage, axis=0).astype(np.float32)
+        if len(coverage)
+        else np.zeros(nchans, dtype=np.float32)
+    )
+    output_times = np.arange(start, stop, dtype=np.int64)
+    for row, offsets in enumerate(delays):
+        total = np.zeros(nt, dtype=np.float32)
+        for channel, offset in enumerate(offsets):
+            source_times = output_times + offset
+            valid = (source_times >= 0) & (source_times < len(data))
+            values = np.full(nt, fill[channel], dtype=np.float32)
+            values[valid] = data[source_times[valid], channel]
+            total += values
+        result[row] = total / nchans
+    return result, delays
+
+
+def _direct_candidate_channels(data, frequencies, tsamp, dm, start, stop):
+    """Independent direct-index reference for Candidate.dedisperse()."""
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    delays = np.rint(
+        4148808.0
+        * float(dm)
+        * (1.0 / frequencies**2 - 1.0 / frequencies.max() ** 2)
+        / 1000.0
+        / tsamp
+    ).astype(np.int64)
+    output = np.empty((stop - start, len(frequencies)), dtype=np.float32)
+    if stop == start:
+        return output
+    source_start = max(0, start + int(delays.min()))
+    source_stop = min(len(data), stop + int(delays.max()))
+    coverage = data[source_start:source_stop]
+    fill = (
+        np.median(coverage, axis=0).astype(np.float32)
+        if len(coverage)
+        else np.zeros(len(frequencies), dtype=np.float32)
+    )
+    output_times = np.arange(start, stop, dtype=np.int64)
+    for channel, offset in enumerate(delays):
+        source_times = output_times + offset
+        valid = (source_times >= 0) & (source_times < len(data))
+        output[:, channel] = fill[channel]
+        output[valid, channel] = data[source_times[valid], channel]
+    return output
+
+
 def public_checks(module, rfi):
     data = (np.arange(129 * 37) % 251).astype(np.uint8).reshape(129, 37)
-    obj = candidate(module, data)
-    names = ("_rust_dedisperse", "_rust_dedispersets", "_rust_dmtime")
-    with ExitStack() as stack:
-        calls = [
-            stack.enter_context(patch.object(module, name, wraps=getattr(module, name)))
-            for name in names
-        ]
-        actual = outputs(obj)
-        assert all(call.call_count > 0 for call in calls)
-    # int64 takes the NumPy route while retaining these small integer values.
-    expected = outputs(candidate(module, data.astype(np.int64)))
-    for a, b in zip(actual, expected):
-        same(a, b)
+    # Keep coverage of the public API over layouts and dtypes, but validate it
+    # against absolute source indexing rather than another Candidate instance.
+    for sample in (
+        data,
+        data[:, ::2],
+        np.asfortranarray(data),
+        np.zeros_like(data),
+        np.empty((0, 3), np.uint8),
+    ):
+        obj = candidate(module, sample)
+        frequencies = obj.chan_freqs
+        obj.dedisperse()
+        same(
+            obj.dedispersed,
+            _direct_candidate_channels(
+                sample, frequencies, obj.native_tsamp, obj.dm, 0, len(sample)
+            ),
+        )
+        same(obj.dedispersets(), obj.dedispersed.sum(axis=1, dtype=np.float32))
+
+        dms = np.linspace(0, 2 * obj.dm, 5)
+        dmt_expected, _ = direct_candidate_reference(
+            sample, frequencies, obj.native_tsamp, dms, 0, len(sample)
+        )
+        obj.dmtime(dmsteps=5)
+        same(obj.dmt, dmt_expected)
+
+    # Exercise the highest-frequency reference for both channel orderings and
+    # explicit dmsteps/time_range overrides on the public Candidate methods.
+    rng = np.random.default_rng(20261017)
+    for fch1, foff in ((1600.0, -400.0), (400.0, 400.0)):
+        sample = rng.integers(0, 100, (48, 4), dtype=np.uint16)
+        obj = candidate(module, sample)
+        obj.dm = 0.4
+        obj.fch1 = fch1
+        obj.foff = foff
+        start, stop = 9, 37
+        obj.dedisperse(time_range=(start, stop))
+        expected_ft = _direct_candidate_channels(
+            sample, obj.chan_freqs, obj.native_tsamp, obj.dm, start, stop
+        )
+        same(obj.dedispersed, expected_ft)
+        same(
+            obj.dedispersets(time_range=(start, stop)),
+            expected_ft.sum(axis=1, dtype=np.float32),
+        )
+        dms = np.linspace(0, 2 * obj.dm, 1)
+        expected_dmt, _ = direct_candidate_reference(
+            sample, obj.chan_freqs, obj.native_tsamp, dms, start, stop
+        )
+        obj.dmtime(dmsteps=1, time_range=(start, stop))
+        same(obj.dmt, expected_dmt)
+        assert obj.dmt.shape == (1, stop - start)
+
+        obj.dmtime(dmsteps=4, time_range=(start, stop))
+        expected_dmt, _ = direct_candidate_reference(
+            sample,
+            obj.chan_freqs,
+            obj.native_tsamp,
+            np.linspace(0, 2 * obj.dm, 4),
+            start,
+            stop,
+        )
+        same(obj.dmt, expected_dmt)
+
+    # Missing end samples use the median of real coverage; they never wrap to
+    # the first samples in the in-memory chunk.
+    edge_data = np.arange(32 * 4, dtype=np.float32).reshape(32, 4)
+    edge = candidate(module, edge_data)
+    edge.dm = 0.8
+    edge.fch1, edge.foff = 1600.0, -400.0
+    start, stop = 27, 32
+    edge.dedisperse(time_range=(start, stop))
+    same(
+        edge.dedispersed,
+        _direct_candidate_channels(
+            edge_data, edge.chan_freqs, edge.native_tsamp, edge.dm, start, stop
+        ),
+    )
+    assert not np.array_equal(edge.dedispersed[-1], edge_data[0])
+
     for sample in (
         data,
         data[:, ::2],
@@ -175,7 +303,8 @@ def public_checks(module, rfi):
     with patch.object(rfi, "_rust_rfi_stats", wraps=rfi._rust_rfi_stats) as call:
         rfi.spectral_kurtosis(data, N=3)
         assert call.call_count == 1
-    # Float64 overflow must retain NumPy's exception policy via the fallback.
+    # Extreme float64 inputs must retain NumPy's overflow exception policy by
+    # taking Candidate's safe conversion path instead of the Rust fast path.
     obj = candidate(module, np.full((4, 3), 1e300))
     with patch.object(
         module, "_rust_dedisperse", side_effect=AssertionError("native float64 route")
