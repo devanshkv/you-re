@@ -1,5 +1,8 @@
 import gc
 import pickle
+import subprocess
+import sys
+import textwrap
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -643,6 +646,66 @@ def test_queued_save_uses_preflighted_filename():
 
     assert saved == [("output", "stable-candidate.h5")]
     assert report["output_file"].endswith("stable-candidate.h5")
+
+
+def test_run_jobs_failure_does_not_wait_for_unconsumed_queue_payload(tmp_path):
+    from pathlib import Path
+
+    repo = Path(__file__).parents[1]
+    script = tmp_path / "queue_failure.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+            import sys
+            import time
+
+            import numpy as np
+            sys.path.insert(0, {str(repo)!r})
+            import your.utils.candidate_scheduler as scheduler
+            from your.utils.candidate_scheduler import CandidateJob
+
+            class Plan:
+                required_start = 0
+                required_stop = 1
+
+            def fail_without_consuming(device, _job_queue, result_queue, *_args):
+                time.sleep(0.5)
+                result_queue.put({{
+                    "type": "error",
+                    "device": device,
+                    "index": 0,
+                    "error": "synthetic worker failure",
+                    "traceback": "",
+                }})
+
+            if __name__ == "__main__":
+                scheduler._gpu_worker = fail_without_consuming
+                job = CandidateJob(
+                    ("obs.fil",),
+                    {{"payload": np.zeros(16 * 1024 * 1024, dtype=np.uint8)}},
+                    Plan(),
+                    0,
+                )
+                try:
+                    scheduler.run_jobs([job], gpu_ids=[0])
+                except RuntimeError as error:
+                    print(f"RUN_JOBS_RETURNED {{error}}", flush=True)
+                print("SCRIPT_FINISHED", flush=True)
+            """
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "GPU 0 failed during candidate 0" in completed.stdout
+    assert "SCRIPT_FINISHED" in completed.stdout
 
 
 def test_candmaker_cpu_duplicate_rows_get_distinct_files_and_keep_10_field_api(

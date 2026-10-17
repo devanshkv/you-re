@@ -1149,6 +1149,7 @@ def run_jobs(
         }
 
     reports: dict[int, dict[str, Any]] = {}
+    completed_successfully = False
     try:
         completed_workers = 0
         while completed_workers < len(workers):
@@ -1223,6 +1224,7 @@ def run_jobs(
             raise RuntimeError(
                 f"GPU workers completed without reports for candidate indices {missing}"
             )
+        completed_successfully = True
         return [reports[index] for index in sorted(reports)]
     finally:
         for state in workers.values():
@@ -1230,5 +1232,8 @@ def run_jobs(
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+            if not completed_successfully:
+                # A failed worker can leave this feeder writing to an unread pipe.
+                state["queue"].cancel_join_thread()
             state["queue"].close()
         result_queue.close()
