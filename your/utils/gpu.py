@@ -14,11 +14,12 @@ from your.utils.candidate_contract import parse_kill_mask
 
 logger = logging.getLogger(__name__)
 
-_CHANNEL_TILE = 32
+_CHANNEL_TILE = 256
 _TIME_TILE = 128
 _DM_TILE = 8
 _KERNELS = {}
 _KERNELS_LOCK = threading.Lock()
+_RESIZE_GUARD_REDUCERS = {}
 _DTYPE_SUFFIX = {
     np.dtype(np.uint8): "u8",
     np.dtype(np.uint16): "u16",
@@ -42,7 +43,7 @@ def _cupy():
         import cupy as cp
     except ImportError as exc:
         raise RuntimeError(
-            "CuPy with CUDA 12 support is required for GPU processing"
+            "CuPy with CUDA 12.x or 13.x support is required for GPU processing"
         ) from exc
     return cp
 
@@ -319,6 +320,63 @@ def _dmt_shared_capacity(delays, channel_start, channel_stop, max_shared):
     return int(capacities.max(initial=_TIME_TILE))
 
 
+def _float32_resize_guard_reducer(cp):
+    device_id = cp.cuda.runtime.getDevice()
+    with _KERNELS_LOCK:
+        reducer = _RESIZE_GUARD_REDUCERS.get(device_id)
+        if reducer is None:
+            reducer = cp.ReductionKernel(
+                "uint32 x",
+                "bool y",
+                "((x & 2147483647U) != 0U) && ((x & 2147483647U) < 507307272U)",
+                "a || b",
+                "y = a",
+                "false",
+                "has_resize_sensitive_float32",
+            )
+            _RESIZE_GUARD_REDUCERS[device_id] = reducer
+    return reducer
+
+
+def _has_resize_sensitive_float32(cp, values):
+    """Detect nonzero values below 1e-20 using bits to avoid FTZ comparisons."""
+    if values.dtype != cp.float32:
+        raise TypeError("resize guard requires float32 values")
+    return _float32_resize_guard_reducer(cp)(values.view(cp.uint32))
+
+
+def _resize_binned_ft(cp, ft_binned, frequency_size):
+    """Resize supported-range float32 FT products on the GPU."""
+    from cupyx.scipy.ndimage import gaussian_filter1d, zoom
+
+    limit = cp.finfo(cp.float32).max
+    ft_binned = cp.nan_to_num(
+        ft_binned, copy=False, nan=0.0, posinf=limit, neginf=-limit
+    )
+    nchans = ft_binned.shape[1]
+    image = ft_binned.T
+    factor = nchans / frequency_size
+    if factor > 1:
+        image = gaussian_filter1d(
+            image,
+            sigma=(factor - 1) / 2,
+            axis=0,
+            mode="constant",
+            cval=0.0,
+        )
+    resized = zoom(
+        image,
+        (frequency_size / nchans, 1.0),
+        order=1,
+        mode="grid-constant",
+        cval=0.0,
+        prefilter=False,
+        grid_mode=True,
+    )
+    cp.clip(resized, ft_binned.min(), ft_binned.max(), out=resized)
+    return resized
+
+
 def _compute_binned_products(
     *,
     cp,
@@ -345,6 +403,7 @@ def _compute_binned_products(
     compute_ft=True,
     compute_dmt=True,
     input_scale=1.0,
+    ft_frequency_size=None,
 ):
     if not np.isfinite(input_scale) or input_scale <= 0:
         raise ValueError("input_scale must be finite and positive")
@@ -354,8 +413,13 @@ def _compute_binned_products(
         return None, None
     if native_count == 0:
         dmsteps = int(np.asarray(delays).shape[0])
+        ft_shape = (
+            (ft_frequency_size, time_size)
+            if ft_frequency_size is not None
+            else (time_size, nchans)
+        )
         return (
-            np.empty((time_size, nchans), dtype=np.float32) if compute_ft else None,
+            np.empty(ft_shape, dtype=np.float32) if compute_ft else None,
             np.empty((dmsteps, time_size), dtype=np.float32) if compute_dmt else None,
         )
     dtype = np.dtype(resident.dtype if resident is not None else data.dtype)
@@ -554,17 +618,45 @@ def _compute_binned_products(
                 )
             bin_stop.record(stream)
 
+            resize_fallback_flag = None
+            if compute_ft and ft_frequency_size is not None:
+                if dtype not in _BOUNDED_SCALE_DTYPES:
+                    resize_fallback_flag = _has_resize_sensitive_float32(cp, ft_binned)
+                resize_stop = _event_start(cp, stream, events, "resize")
+                ft_download = _resize_binned_ft(cp, ft_binned, ft_frequency_size)
+                resize_stop.record(stream)
+            else:
+                ft_download = ft_binned
+
             download_stop = _event_start(cp, stream, events, "download")
             ft_host = (
-                None if not compute_ft else ft_binned.get(stream=stream, blocking=False)
+                None
+                if not compute_ft
+                else ft_download.get(stream=stream, blocking=False)
             )
             dmt_host = (
                 None
                 if not compute_dmt
                 else dmt_binned.get(stream=stream, blocking=False)
             )
+            resize_fallback_host = (
+                None
+                if resize_fallback_flag is None
+                else resize_fallback_flag.get(stream=stream, blocking=False)
+            )
             download_stop.record(stream)
             stream.synchronize()
+
+        if resize_fallback_host is not None and bool(
+            np.asarray(resize_fallback_host).item()
+        ):
+            fallback_started = perf_counter()
+            from your.utils.candidate_pipeline import _resize_ft
+
+            ft_source = ft_binned.get(stream=stream)
+            ft_host = _resize_ft(ft_source, ft_frequency_size)
+            if profile is not None:
+                profile["resize_fallback_s"] = perf_counter() - fallback_started
 
         if profile is not None:
             for name, elapsed in _elapsed_events(cp, events).items():
@@ -591,6 +683,20 @@ def estimate_process_gpu_bytes(plan, input_dtype):
     median_workspace = group_channels * read_count * 32 if needs_medians else 0
     native_products = int(plan.native_count) * (channels + dmsteps) * 4
     binned_products = int(plan.time_size) * (channels + dmsteps) * 4
+    resize_workspace = 0
+    resize_guard_scratch = 0
+    if int(plan.frequency_size) != channels:
+        resize_workspace = int(plan.time_size) * int(plan.frequency_size) * 4
+        if int(plan.frequency_size) < channels:
+            resize_workspace += int(plan.time_size) * channels * 4
+            sigma = (channels / int(plan.frequency_size) - 1) / 2
+            radius = int(4 * sigma + 0.5)
+            resize_workspace += 12 * (2 * radius + 1)
+        if dtype not in _BOUNDED_SCALE_DTYPES:
+            # Reserve one uint32 partial per warp-sized chunk for this scalar
+            # reduction; the allocator slack below covers alignment.
+            detector_elements = int(plan.time_size) * channels
+            resize_guard_scratch = ((detector_elements + 31) // 32) * 4
     delay_tables = (channels + dmsteps * channels) * 8
     return int(
         staged
@@ -598,8 +704,10 @@ def estimate_process_gpu_bytes(plan, input_dtype):
         + median_workspace
         + native_products
         + binned_products
+        + resize_workspace
+        + resize_guard_scratch
         + delay_tables
-        + 64 * 1024
+        + 64 * 1024  # CuPy allocator and small-kernel slack.
     )
 
 
@@ -679,6 +787,7 @@ def process_gpu(
         )
     if profile is not None:
         profile.setdefault("mask_s", perf_counter() - started)
+    ft_resized = plan.frequency_size != plan.nchans
     ft, dmt = _compute_binned_products(
         cp=cp,
         data=data,
@@ -702,11 +811,12 @@ def process_gpu(
         stream=stream,
         profile=profile,
         input_scale=input_scale,
+        ft_frequency_size=plan.frequency_size if ft_resized else None,
     )
     from your.utils.candidate_pipeline import finish_products
 
     started = perf_counter()
-    result = finish_products(ft, dmt, plan, profile=profile)
+    result = finish_products(ft, dmt, plan, profile=profile, ft_resized=ft_resized)
     if profile is not None:
         profile["finish_s"] = perf_counter() - started
     return result

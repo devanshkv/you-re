@@ -20,20 +20,48 @@ and HDF5 datasets default to FP16; `--output_dtype float32` retains FP32 output.
 The Rust extension is required for CPU processing. GPU processing is optional:
 
 ```bash
-python -m pip install -e '.[test,gpu]'
+uv venv
+source .venv/bin/activate
+uv pip install -e '.[test,cupy-cuda12x]'
 CUDA_PATH=/usr/local/cuda-12.9 python bin/your_candmaker.py \
   -c /data/candidates.csv -o /data/products -g 0 \
   --profile_json /data/products/profile.json
 ```
 
-The GPU extra selects CuPy 13 with CUDA 12. The development configuration is
-Python 3.12, CuPy 13.6, CUDA 12.9 and a 16 GB V100. CUDA installation location and
-CuPy wheel support must match the target interpreter; CPU-only installation does
-not import CuPy or Numba. Numba is no longer a dependency.
+For CUDA 13.x, use `uv pip install -e '.[test,cupy-cuda13x]'` instead. Select one
+CuPy extra only; CuPy's CUDA 12.x and 13.x wheels cannot be installed together.
+After publishing the renamed package, install it with one of these commands:
+
+```bash
+uv pip install 'you-re[cupy-cuda12x]'  # CUDA 12.x
+# or
+uv pip install 'you-re[cupy-cuda13x]'  # CUDA 13.x
+```
+
+The legacy `gpu` extra remains an alias for `cupy-cuda12x`.
+
+The development configuration is Python 3.12, CuPy 13.6, CUDA 12.9 and a 16 GB
+V100. CUDA installation location and CuPy wheel support must match the target
+interpreter; CPU-only installation does not install or import CuPy or Numba.
+Numba is no longer a dependency.
 
 Use `-g -1` for CPU. Multiple explicit IDs such as `-g 2 3` start one independent
 spawned worker per device. The implementation allows duplicate observation
 coverage on different GPUs; multi-GPU hardware validation is deferred.
+
+On CPU, `-n` sets the number of candidate processes. Each process divides the
+available CPU affinity budget by that process count for its Rust threads, with
+at least one thread per process. Direct `Candidate.make_products()` calls use
+one CPU thread unless `cpu_threads` is supplied. Bounded integer input uses
+channel-band transposes and prefix boundaries; contiguous residue tables are
+selected when their construction and bounded scratch memory are worthwhile.
+Prepared float64 input retains its single-threaded fallback, including
+fractional median padding. All paths use the same real right-hand input coverage.
+
+Finite FP32 frequency planes shrinking by an integer factor use main's native
+Gaussian/interpolation resize, matching skimage bit for bit. Other shapes and
+dtypes retain skimage. CuPy's regular path keeps its on-device resize; bounded
+streaming can use the faster CPU resize when eligible.
 
 ## Scheduling and memory
 
@@ -69,10 +97,19 @@ CPU. Budgets below 64 KiB cannot run the streaming path. Host disk space must fi
 the candidate's real input coverage.
 
 GPU input sampling, shared-memory DM tiling and time binning use CuPy CUDA
-kernels. Final resize, detrending and normalization currently stay on CPU, as
-does existing optional RFI mask calculation. These stages are individually timed.
-There is no cuCIM dependency: move another stage only when full-pipeline
-measurements justify the dependency and transfer/synchronization costs.
+kernels. Regular GPU processing also performs the anti-aliased frequency resize
+on-device before downloading the smaller image. It uses CuPy's Gaussian filter
+and linear interpolation with the same boundary and clipping rules as skimage;
+there is no cuCIM dependency. Detrending, normalization and optional RFI mask
+calculation remain on CPU. Memory-bounded streaming retains its CPU resize.
+Floating-input FT planes containing nonzero magnitudes below `1e-20` use the
+shared CPU resize to avoid CUDA flushing small weighted values to zero. The
+check uses a device reduction and the existing download synchronization;
+bounded integer and float16 input skips it. Workspace estimates include its
+reduction scratch. Profiles record this exceptional host work as
+`resize_fallback_s`.
+Profiles record GPU resizing as `resize_s`; `resize_seconds` measures only the
+remaining host-side resize/copy step.
 
 ## Benchmark against the unchanged checkout
 

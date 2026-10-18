@@ -1,15 +1,17 @@
+import argparse
+import functools
+import json
 import logging
+import os
 
 import numpy as np
+from scipy import ndimage as _ndimage
+from skimage.transform import resize
 
+from your._rust import gaussian_decimate as _rust_gaussian_decimate
 from your.utils.math import closest_number
 
 logger = logging.getLogger(__name__)
-import argparse
-import json
-import os
-
-from skimage.transform import resize
 
 
 def _decimate(data, decimate_factor, axis, pad=False, **kwargs):
@@ -68,6 +70,50 @@ def _resize(data, size, axis, **kwargs):
         return resize(data, (data.shape[0], size), **kwargs)
     else:
         return resize(data, (size, data.shape[1]), **kwargs)
+
+
+@functools.lru_cache(maxsize=8)
+def _half_gaussian(factor):
+    """Return the centre and one side of SciPy's symmetric anti-alias kernel."""
+    sigma = (factor - 1) / 2
+    radius = int(4.0 * sigma + 0.5)
+    impulse = np.zeros(2 * radius + 3)
+    impulse[radius + 1] = 1.0
+    response = _ndimage.gaussian_filter1d(impulse, sigma, mode="constant")
+    if response[0] != 0 or not np.array_equal(response, response[::-1]):
+        return None
+    return response[radius + 1 : 2 * radius + 2].copy()
+
+
+def _anti_aliased_shrink(data, size):
+    """Match skimage's anti-aliased row shrink for finite float32 arrays."""
+    if (
+        type(data) is not np.ndarray
+        or data.dtype != np.float32
+        or data.ndim != 2
+        or data.size == 0
+        or isinstance(size, (bool, np.bool_))
+        or not isinstance(size, (int, np.integer))
+        or size <= 0
+        or data.shape[1] % size
+        or data.shape[1] // size < 2
+    ):
+        return None
+    size = int(size)
+    lo, hi = data.min(), data.max()
+    # NaN and infinity reach further through SciPy's zero-weight terms.
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None
+    factor = data.shape[1] // size
+    weights = _half_gaussian(factor)
+    if weights is None:
+        return None
+    out = _rust_gaussian_decimate(np.ascontiguousarray(data), weights, factor)
+    # Include skimage's constant-mode cval in the clipping range when needed.
+    if not lo <= 0 <= hi and out.min() <= 0 <= out.max():
+        lo, hi = min(lo, np.float32(0)), max(hi, np.float32(0))
+    np.clip(out, lo, hi, out=out)
+    return out
 
 
 def crop(data, start_sample, length, axis):

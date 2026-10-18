@@ -318,6 +318,67 @@ def public_checks(module, rfi):
                 raise AssertionError("float64 conversion did not raise")
 
 
+def candidate_binned_checks(native):
+    # Cross a Rust band boundary and channel tail, use nonzero right-hand
+    # delays, and leave masked channels in the output denominator.
+    rng = np.random.default_rng(20261018)
+    data = rng.integers(0, 251, size=(73, 131), dtype=np.uint8)
+    dm_delays = np.fromfunction(
+        lambda dm, channel: (3 * dm + channel) % 5, (64, 131), dtype=int
+    ).astype(np.int64)
+    ft_delays = (np.arange(data.shape[1]) % 5).astype(np.int64)
+    enabled = np.ones(data.shape[1], dtype=bool)
+    enabled[1::7] = False
+    start, time_bin, time_size = 2, 3, 4
+
+    expected_ft = np.zeros((time_size, data.shape[1]), dtype=np.float32)
+    for out_time in range(time_size):
+        for channel in range(data.shape[1]):
+            if enabled[channel]:
+                lo = start + int(ft_delays[channel]) + out_time * time_bin
+                total = sum(int(value) for value in data[lo : lo + time_bin, channel])
+                expected_ft[out_time, channel] = total / time_bin
+
+    expected_dmt = np.zeros((len(dm_delays), time_size), dtype=np.float32)
+    for dm, delays in enumerate(dm_delays):
+        for out_time in range(time_size):
+            total = 0
+            for channel, delay in enumerate(delays):
+                if enabled[channel]:
+                    lo = start + int(delay) + out_time * time_bin
+                    total += sum(
+                        int(value) for value in data[lo : lo + time_bin, channel]
+                    )
+            expected_dmt[dm, out_time] = total / (data.shape[1] * time_bin)
+
+    for threads in (1, 4):
+        ft, dmt = native.candidate_binned(
+            data,
+            dm_delays,
+            ft_delays,
+            start,
+            time_bin,
+            time_size,
+            enabled=enabled,
+            threads=threads,
+        )
+        same(ft, expected_ft)
+        same(dmt, expected_dmt)
+
+
+def resize_checks():
+    from skimage.transform import resize
+
+    from your.utils.misc import _anti_aliased_shrink
+
+    rng = np.random.default_rng(20261018)
+    data = rng.standard_normal((13, 96)).astype(np.float32)
+    expected = resize(data, (13, 24), anti_aliasing=True, mode="constant")
+    actual = _anti_aliased_shrink(data, 24)
+    assert actual is not None
+    same(actual, expected)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--missing-rust", action="store_true")
@@ -345,9 +406,18 @@ def main():
 
     from your import _rust
 
-    for name in ("dedisperse", "dedispersets", "dmtime", "rfi_stats"):
+    for name in (
+        "dedisperse",
+        "dedispersets",
+        "dmtime",
+        "candidate_binned",
+        "rfi_stats",
+        "gaussian_decimate",
+    ):
         assert callable(getattr(_rust, name))
     direct_checks(_rust)
+    candidate_binned_checks(_rust)
+    resize_checks()
     import your.candidate as module
     from your.utils import rfi
 

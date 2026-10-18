@@ -2,6 +2,46 @@
 requires = ["setuptools>=62.4", "setuptools-rust==1.13.0"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "you-re"
+dynamic = ["version", "dependencies"]
+description = "A unified reader for sigproc filterbank and psrfits data"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Devansh Agarwal", email = "da0017@mix.wvu.edu" },
+    { name = "Kshitij Aggarwal", email = "ka0064@mix.wvu.edu" },
+]
+classifiers = [
+    "Natural Language :: English",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov"]
+cupy-cuda12x = ["cupy-cuda12x>=13.6,<15"]
+cupy-cuda13x = ["cupy-cuda13x>=14,<15"]
+gpu = ["cupy-cuda12x>=13.6,<15"]
+
+[project.urls]
+Homepage = "https://github.com/devanshkv/you-re"
+
+[tool.setuptools.dynamic]
+version = { attr = "your.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.package-data]
+"your.utils" = ["*.cu"]
+
 [tool.ruff]
 # Default line length, same as Black
 line-length = 88

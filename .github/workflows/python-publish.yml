@@ -1,4 +1,4 @@
-name: Publish your to PyPI and TestPyPI
+name: Publish you-re to PyPI and TestPyPI
 
 on: push
 
@@ -54,7 +54,7 @@ jobs:
 
   publish-to-pypi:
     name: >-
-      Publish your to PyPI
+      Publish you-re to PyPI
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'  # only publish to PyPI on tag pushes or GitHub releases
     needs:
     - sdist
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/your
+      url: https://pypi.org/p/you-re
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
 
@@ -79,7 +79,7 @@ jobs:
   publish-to-testpypi:
   # Only thepetabyteproject can publish to TestPyPI, so skip for others, otherwise other CI tests are stopped.
     if: github.repository_owner == 'thepetabyteproject'  
-    name: Publish your TestPyPI
+    name: Publish you-re TestPyPI
     needs:
     - sdist
     - wheels
@@ -87,7 +87,7 @@ jobs:
 
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/your
+      url: https://test.pypi.org/p/you-re
 
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
@@ -99,7 +99,7 @@ jobs:
         pattern: distribution-*
         merge-multiple: true
         path: dist/
-    - name: Publish your TestPyPI
+    - name: Publish you-re TestPyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         skip-existing: true

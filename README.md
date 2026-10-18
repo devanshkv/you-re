@@ -48,22 +48,30 @@ before any analysis can be done on it.
 The inspiration for the name comes from the introduction of every [Daily Dose of Internet](https://www.youtube.com/channel/UCdC0An4ZPNr_YiFiYoVbwaw) video.
 
 # Installation
-You can install `your` directly using `pip`
+Create and activate a virtual environment first:
 
 ```bash
-pip install your
-```
-Or if you want to try out the lastest stuff,
-```bash
-pip install git+https://github.com/thepetabyteproject/your.git
+uv venv
+source .venv/bin/activate
 ```
 
-or you can do: 
+After the next release is published on PyPI, install `you-re` with `uv`:
+
 ```bash
-git clone https://github.com/thepetabyteproject/your.git
-cd your
-pip install -r requirements.txt
-python -m pip install .
+uv pip install you-re
+```
+For the current development version:
+
+```bash
+uv pip install git+https://github.com/devanshkv/you-re.git
+```
+
+Or install from a checkout:
+
+```bash
+git clone https://github.com/devanshkv/you-re.git
+cd you-re
+uv pip install .
 ``` 
 
 **Note**:
@@ -81,8 +89,20 @@ MPLBACKEND=Agg uv run --no-project python -m pytest
 
 GPU tests are skipped automatically when CUDA is unavailable.
 
-For CuPy candidate processing on CUDA 12, install `pip install 'your[gpu]'`
-(or `pip install -e '.[test,gpu]'` from source). Candidate products default to FP16.
+For CuPy candidate processing, choose the extra matching your CUDA toolkit:
+
+After the `you-re` release is published:
+
+```bash
+uv pip install 'you-re[cupy-cuda12x]'  # CUDA 12.x
+# or
+uv pip install 'you-re[cupy-cuda13x]'  # CUDA 13.x
+```
+
+From a checkout, use `uv pip install -e '.[test,cupy-cuda12x]'` or
+`uv pip install -e '.[test,cupy-cuda13x]'`. Install only one CuPy CUDA wheel.
+The legacy `gpu` extra remains an alias for `cupy-cuda12x`. Candidate products
+default to FP16.
 See [candidate processing and profiling](docs/cupy-candidates.md) for the GPU
 scheduler, memory limits, processing semantics, and baseline benchmark commands.
 

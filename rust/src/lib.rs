@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod candidates;
 mod kernels;
+mod resize;
 
 use kernels::{
     fill_dedisperse, fill_dedispersed, fill_dmtime_packed, fill_rfi_stats, numpy_i64, ToF32,
@@ -23,6 +25,8 @@ type RfiStats<'py> = (
     u64,
     f64,
 );
+
+type CandidateProducts<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<f32>>);
 
 #[pyfunction]
 fn rfi_stats<'py>(
@@ -367,11 +371,217 @@ fn dmtime<'py>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // Keep validation aligned with the Python entry point.
+fn candidate_binned_view<'py, T: candidates::CandidateSample>(
+    py: Python<'py>,
+    data: numpy::ndarray::ArrayView2<'_, T>,
+    dm_delay_bins: numpy::ndarray::ArrayView2<'_, i64>,
+    ft_delay_bins: numpy::ndarray::ArrayView1<'_, i64>,
+    enabled: Option<numpy::ndarray::ArrayView1<'_, bool>>,
+    start: usize,
+    time_bin: usize,
+    time_size: usize,
+    threads: usize,
+) -> PyResult<CandidateProducts<'py>> {
+    if time_bin == 0 || time_size == 0 {
+        return Err(PyValueError::new_err(
+            "time_bin and time_size must be positive",
+        ));
+    }
+
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    let dmsteps = dm_delay_bins.shape()[0];
+    if dm_delay_bins.shape() != [dmsteps, nf]
+        || ft_delay_bins.shape() != [nf]
+        || enabled.is_some_and(|mask| mask.shape() != [nf])
+    {
+        return Err(PyValueError::new_err(
+            "delay bins and enabled mask must match the input channels",
+        ));
+    }
+    if nf == 0 || dmsteps == 0 {
+        return Err(PyValueError::new_err(
+            "candidate products require channels and DM trials",
+        ));
+    }
+
+    let max_delay = dm_delay_bins.iter().chain(ft_delay_bins.iter()).try_fold(
+        0_usize,
+        |max_delay, &delay| {
+            let delay = usize::try_from(delay)
+                .map_err(|_| PyValueError::new_err("delay bins must be nonnegative"))?;
+            Ok::<_, PyErr>(max_delay.max(delay))
+        },
+    )?;
+    let native_len = time_bin
+        .checked_mul(time_size)
+        .ok_or_else(|| PyMemoryError::new_err("candidate output is too large"))?;
+    let end = start
+        .checked_add(native_len)
+        .and_then(|end| end.checked_add(max_delay))
+        .ok_or_else(|| PyValueError::new_err("candidate source range overflows"))?;
+    if end > nt {
+        return Err(PyValueError::new_err(
+            "candidate source samples escape the nonwrapping input",
+        ));
+    }
+    nf.checked_mul(time_bin)
+        .and_then(|_| nf.checked_mul(time_size))
+        .and_then(|_| dmsteps.checked_mul(time_size))
+        .and_then(|_| time_size.checked_add(1))
+        .and_then(|boundary_width| dmsteps.checked_mul(boundary_width))
+        .and_then(|_| nt.checked_add(1))
+        .and_then(|_| nt.checked_mul(8))
+        .ok_or_else(|| PyMemoryError::new_err("candidate products are too large"))?;
+
+    let (ft, dmt) = py
+        .detach(|| {
+            candidates::binned_products(
+                data,
+                dm_delay_bins,
+                ft_delay_bins,
+                enabled,
+                start,
+                time_bin,
+                time_size,
+                threads,
+            )
+        })
+        .map_err(|_| PyMemoryError::new_err("candidate products are too large"))?;
+    let ft = Array2::from_shape_vec((time_size, nf), ft)
+        .map_err(|_| PyMemoryError::new_err("candidate products are too large"))?
+        .into_pyarray(py);
+    let dmt = Array2::from_shape_vec((dmsteps, time_size), dmt)
+        .map_err(|_| PyMemoryError::new_err("candidate products are too large"))?
+        .into_pyarray(py);
+    Ok((ft, dmt))
+}
+
+#[pyfunction(signature = (data, dm_delay_bins, ft_delay_bins, start, time_bin, time_size, enabled=None, threads=1))]
+#[allow(clippy::too_many_arguments)] // Python also supplies the interpreter token.
+fn candidate_binned<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    dm_delay_bins: PyReadonlyArray2<'py, i64>,
+    ft_delay_bins: PyReadonlyArray1<'py, i64>,
+    start: usize,
+    time_bin: usize,
+    time_size: usize,
+    enabled: Option<PyReadonlyArray1<'py, bool>>,
+    threads: usize,
+) -> PyResult<CandidateProducts<'py>> {
+    let data = data.cast::<PyUntypedArray>()?;
+    if data.ndim() != 2 {
+        return Err(PyValueError::new_err(
+            "data must be a two-dimensional array",
+        ));
+    }
+    if !data.is_aligned() || !dm_delay_bins.is_aligned() || !ft_delay_bins.is_aligned() {
+        return Err(PyValueError::new_err("data and delay bins must be aligned"));
+    }
+    if enabled.as_ref().is_some_and(|mask| !mask.is_aligned()) {
+        return Err(PyValueError::new_err("enabled mask must be aligned"));
+    }
+
+    let dm_delays = dm_delay_bins.as_array();
+    let ft_delays = ft_delay_bins.as_array();
+    let enabled = enabled.as_ref().map(|mask| mask.as_array());
+    let type_num = data.dtype().num();
+    macro_rules! dispatch {
+        ($ty:ty) => {{
+            let typed = data.cast::<PyArray2<$ty>>()?.readonly();
+            candidate_binned_view(
+                py,
+                typed.as_array(),
+                dm_delays,
+                ft_delays,
+                enabled,
+                start,
+                time_bin,
+                time_size,
+                threads,
+            )
+        }};
+    }
+
+    if type_num == dtype::<bool>(py).num() {
+        dispatch!(bool)
+    } else if type_num == dtype::<u8>(py).num() {
+        dispatch!(u8)
+    } else if type_num == dtype::<u16>(py).num() {
+        dispatch!(u16)
+    } else if type_num == dtype::<u32>(py).num() {
+        dispatch!(u32)
+    } else if type_num == dtype::<u64>(py).num() {
+        dispatch!(u64)
+    } else if type_num == dtype::<i8>(py).num() {
+        dispatch!(i8)
+    } else if type_num == dtype::<i16>(py).num() {
+        dispatch!(i16)
+    } else if type_num == dtype::<i32>(py).num() {
+        dispatch!(i32)
+    } else if type_num == dtype::<i64>(py).num() {
+        dispatch!(i64)
+    } else if type_num == dtype::<f64>(py).num() {
+        dispatch!(f64)
+    } else {
+        Err(PyTypeError::new_err(
+            "data dtype is not supported by your._rust.candidate_binned",
+        ))
+    }
+}
+
+/// skimage's `resize(data, (nt, nf // factor), anti_aliasing=True,
+/// mode="constant")` of float32 rows before its clip.
+#[pyfunction]
+fn gaussian_decimate<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray1<'py, f64>,
+    factor: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    if factor == 0 || nf == 0 || nf % factor != 0 {
+        return Err(PyValueError::new_err(
+            "expected factor >= 1 dividing a non-zero number of columns",
+        ));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let weights = weights
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("weights must be contiguous"))?;
+    if weights.is_empty() {
+        return Err(PyValueError::new_err("weights must not be empty"));
+    }
+    let size = nf / factor;
+    if nt == 0 {
+        return Array2::from_shape_vec((nt, size), Vec::<f32>::new())
+            .map_err(|_| PyMemoryError::new_err("resized plane is too large"))
+            .map(|out| out.into_pyarray(py));
+    }
+    let output_len = nt
+        .checked_mul(size)
+        .ok_or_else(|| PyMemoryError::new_err("resized plane is too large"))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(output_len)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))?;
+    out.resize(output_len, 0.0_f32);
+    py.detach(|| resize::gaussian_decimate(values, nf, weights, factor, &mut out))
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))?;
+    Array2::from_shape_vec((nt, size), out)
+        .map_err(|_| PyMemoryError::new_err("resized plane is too large"))
+        .map(|out| out.into_pyarray(py))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;
     module.add_function(wrap_pyfunction!(dmtime, module)?)?;
+    module.add_function(wrap_pyfunction!(candidate_binned, module)?)?;
     module.add_function(wrap_pyfunction!(rfi_stats, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_decimate, module)?)?;
     Ok(())
 }

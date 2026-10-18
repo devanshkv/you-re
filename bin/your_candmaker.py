@@ -41,6 +41,9 @@ def cpu_dedisp_dmt(cand, args, profile=None):
     if args.opt_dm:
         cand.get_chunk(for_preprocessing=True)
         cand.optimize_dm()
+    thread_options = (
+        {"cpu_threads": worker_threads(args.nproc)} if hasattr(args, "nproc") else {}
+    )
     return cand.make_products(
         target="CPU",
         time_size=args.time_size,
@@ -48,7 +51,17 @@ def cpu_dedisp_dmt(cand, args, profile=None):
         dmsteps=args.dmsteps,
         output_dtype=args.output_dtype,
         profile=profile,
+        **thread_options,
     )
+
+
+def worker_threads(nproc):
+    """Divide the available cores between CPU candidate workers."""
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    return max(1, cores // nproc)
 
 
 def _input_files(filename, num_files):

@@ -7,6 +7,7 @@ import pytest
 from your.candidate import Candidate
 from your.utils.candidate_pipeline import make_plan, process_cpu
 from your.utils.gpu import (
+    _CHANNEL_TILE,
     _corner_turn,
     _dmt_shared_capacities,
     _dmt_shared_capacity,
@@ -78,6 +79,57 @@ def test_process_gpu_matches_direct_cpu_for_supported_input_types(dtype):
         "download_s",
         "finish_s",
     } <= profile.keys()
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        np.uint8,
+        np.uint16,
+        np.int16,
+        np.int32,
+        np.float16,
+        np.float32,
+        np.float64,
+    ],
+)
+def test_process_gpu_c256_handles_float_inputs_and_257_channel_tail(dtype):
+    import cupy as cp
+
+    rng = np.random.default_rng(442)
+    if np.dtype(dtype).kind in "iu":
+        data = rng.integers(0, 100, size=(512, 257), dtype=dtype)
+    else:
+        data = rng.integers(0, 100, size=(512, 257)).astype(dtype)
+        data[137, 0] = np.nan
+        data[211, -1] = np.inf
+    cand = _candidate(data)
+    cand.dm = 0.0
+    cand.tcand = 0.256
+    cand.width = 128
+    cand.chan_freqs = np.linspace(300.0, 800.0, data.shape[1])
+    cand.your_header = SimpleNamespace(
+        nspectra=len(data), dtype=data.dtype, tsamp=0.001, foff=-1.0
+    )
+    plan = make_plan(
+        cand, time_size=4, frequency_size=16, dmsteps=5, output_dtype="float32"
+    )
+    assert (plan.pad_before, plan.pad_after) == (0, 0)
+    assert _dmt_shared_capacities(plan.delays, 48 * 1024).shape == (2,)
+
+    read_data = data[plan.read_start : plan.read_stop]
+    expected = process_cpu(cand, plan, data=read_data)
+    resident = cp.ascontiguousarray(cp.asarray(read_data.T))
+    actual = process_gpu(
+        cand,
+        plan,
+        resident=resident,
+        resident_start=plan.read_start,
+        device=0,
+    )
+
+    np.testing.assert_allclose(actual[0], expected[0], rtol=2e-4, atol=2e-4)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=2e-4, atol=2e-4)
 
 
 @pytest.mark.parametrize(
@@ -351,32 +403,46 @@ def test_shared_memory_capacity_matches_loop_for_tails_ranges_and_limits(
     dmsteps, monotonic
 ):
     rng = np.random.default_rng(1938)
-    delays = rng.integers(0, 8000, size=(dmsteps, 65), dtype=np.int64)
+    nchans = 2 * _CHANNEL_TILE + 1
+    delays = rng.integers(0, 8000, size=(dmsteps, nchans), dtype=np.int64)
     if monotonic:
         delays.sort(axis=0)
     delays += (np.arange(dmsteps, dtype=np.int64) // 8 * 2**40)[:, None]
-    delays += (np.arange(65, dtype=np.int64) * 2**36)[None, :]
+    delays += (np.arange(nchans, dtype=np.int64) * 2**36)[None, :]
 
-    for start, stop in ((0, 65), (0, 32), (32, 64), (64, 65), (4, 31), (5, 5)):
+    ranges = (
+        (0, nchans),
+        (0, _CHANNEL_TILE),
+        (_CHANNEL_TILE, 2 * _CHANNEL_TILE),
+        (2 * _CHANNEL_TILE, nchans),
+        (4, 31),
+        (5, 5),
+    )
+    for start, stop in ranges:
         for limit in (-1, 0, 508, 512, 48 * 1024, 48 * 1024 + 3):
             expected = _loop_shared_capacity(delays, start, stop, limit)
             assert _dmt_shared_capacity(delays, start, stop, limit) == expected
     for limit in (-1, 0, 508, 512, 48 * 1024, 48 * 1024 + 3):
         expected = [
-            _loop_shared_capacity(delays, start, start + 32, limit)
-            for start in range(0, delays.shape[1], 32)
+            _loop_shared_capacity(
+                delays, start, min(start + _CHANNEL_TILE, nchans), limit
+            )
+            for start in range(0, nchans, _CHANNEL_TILE)
         ]
         np.testing.assert_array_equal(_dmt_shared_capacities(delays, limit), expected)
 
 
 def test_shared_memory_capacity_includes_widest_partial_dm_and_channel_tiles():
-    delays = np.zeros((11, 35), dtype=np.int64)
-    delays[9, 34] = 913
+    nchans = _CHANNEL_TILE + 3
+    delays = np.zeros((11, nchans), dtype=np.int64)
+    delays[9, -1] = 913
 
-    assert _dmt_shared_capacity(delays, 32, 35, 48 * 1024) == 128 + 913
-    assert _dmt_shared_capacity(delays, 0, 32, 48 * 1024) == 128
-    delays[9, 34] = 2**40
-    assert _dmt_shared_capacity(delays, 32, 35, 48 * 1024) == 48 * 1024 // 4
+    assert _dmt_shared_capacity(delays, _CHANNEL_TILE, nchans, 48 * 1024) == 128 + 913
+    assert _dmt_shared_capacity(delays, 0, _CHANNEL_TILE, 48 * 1024) == 128
+    delays[9, -1] = 2**40
+    assert (
+        _dmt_shared_capacity(delays, _CHANNEL_TILE, nchans, 48 * 1024) == 48 * 1024 // 4
+    )
 
 
 @pytest.mark.parametrize("shape", [(0, 0), (0, 65), (1, 1), (11, 35), (17, 129)])
@@ -413,33 +479,44 @@ def test_batched_shared_capacities_honor_dynamic_tiles_and_empty_shapes(
 
 def test_batched_shared_capacities_keep_scalar_floor_for_signed_spread_overflow():
     value = 2**62 + 1
-    delays = np.tile(np.array([-value, value] * 4, dtype=np.int64)[:, None], (1, 65))
+    nchans = 2 * _CHANNEL_TILE + 1
+    delays = np.tile(
+        np.array([-value, value] * 4, dtype=np.int64)[:, None], (1, nchans)
+    )
     expected = [
-        _loop_shared_capacity(delays, start, min(start + 32, 65), 48 * 1024)
-        for start in range(0, 65, 32)
+        _loop_shared_capacity(
+            delays, start, min(start + _CHANNEL_TILE, nchans), 48 * 1024
+        )
+        for start in range(0, nchans, _CHANNEL_TILE)
     ]
     np.testing.assert_array_equal(_dmt_shared_capacities(delays, 48 * 1024), expected)
+    assert len(expected) == 3
     assert expected == [128, 128, 128]
 
 
 def test_batched_shared_capacities_clamp_int64_spreads_before_adding_time_tile():
-    delays = np.zeros((11, 35), dtype=np.int64)
+    nchans = 2 * _CHANNEL_TILE + 3
+    delays = np.zeros((11, nchans), dtype=np.int64)
     delays[7, 0] = np.iinfo(np.int64).max
-    delays[9, 34] = np.iinfo(np.int64).max
-    delays[:, 10] = np.iinfo(np.int64).max - 1
+    delays[9, -1] = np.iinfo(np.int64).max
+    delays[:, _CHANNEL_TILE] = np.iinfo(np.int64).max - 1
 
     for limit in (-1, 508, 48 * 1024):
         expected = [
-            _loop_shared_capacity(delays, start, start + 32, limit) for start in (0, 32)
+            _loop_shared_capacity(
+                delays, start, min(start + _CHANNEL_TILE, nchans), limit
+            )
+            for start in range(0, nchans, _CHANNEL_TILE)
         ]
         np.testing.assert_array_equal(_dmt_shared_capacities(delays, limit), expected)
-        assert _dmt_shared_capacity(delays, 0, 35, limit) == max(expected)
+        assert _dmt_shared_capacity(delays, 0, nchans, limit) == max(expected)
 
 
 def test_process_gpu_sizes_all_channel_groups_once(monkeypatch):
     from your.utils import gpu
 
-    data = np.arange(650, dtype=np.uint16).reshape(10, 65)
+    nchans = 2 * gpu._CHANNEL_TILE + 1
+    data = np.arange(10 * nchans, dtype=np.uint16).reshape(10, nchans)
     cand = _candidate(data)
     cand.chan_freqs = np.linspace(1000.0, 1400.0, data.shape[1])
     plan = make_plan(cand, time_size=4, frequency_size=3, dmsteps=11)
@@ -470,6 +547,31 @@ def test_gpu_workspace_estimate_is_pure_and_positive():
     estimate = estimate_process_gpu_bytes(plan, cand.data.dtype)
     assert estimate > 0
     assert isinstance(estimate, int)
+
+
+def test_gpu_workspace_estimate_accounts_for_256_channel_groups(monkeypatch):
+    from your.utils import gpu
+
+    data = np.zeros((512, 257), dtype=np.float64)
+    cand = _candidate(data)
+    cand.dm = 0.0
+    cand.tcand = 0.256
+    cand.width = 128
+    cand.chan_freqs = np.linspace(300.0, 800.0, data.shape[1])
+    cand.your_header = SimpleNamespace(
+        nspectra=len(data), dtype=data.dtype, tsamp=0.001, foff=-1.0
+    )
+    plan = make_plan(cand, time_size=4, frequency_size=16, dmsteps=5)
+
+    estimate_c256 = estimate_process_gpu_bytes(plan, data.dtype)
+    monkeypatch.setattr(gpu, "_CHANNEL_TILE", 32)
+    estimate_c32 = estimate_process_gpu_bytes(plan, data.dtype)
+
+    assert estimate_c256 > estimate_c32
+    assert (
+        estimate_c256 - estimate_c32
+        >= (256 - 32) * (plan.read_stop - plan.read_start) * data.dtype.itemsize
+    )
 
 
 def _two_channel_candidate(data, kill_mask=None):

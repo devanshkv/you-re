@@ -253,6 +253,87 @@ def test_cpu_products_align_a_pulse_for_both_frequency_orders(frequencies):
     np.testing.assert_array_equal(data, original)
 
 
+@pytest.mark.parametrize("ascending", [False, True])
+def test_parallel_cpu_and_gpu_recover_pulse_from_real_right_halo(ascending):
+    from your.utils.gpu import gpu_available, process_gpu
+
+    frequencies = np.linspace(1500.0, 1200.0, 257)
+    if ascending:
+        frequencies = frequencies[::-1]
+    killed = np.zeros(len(frequencies), dtype=bool)
+    killed[3] = True
+    cand = _candidate(frequencies, nspectra=500, tcand=0.1, dm=20, kill_mask=killed)
+    plan = make_plan(
+        cand, time_size=9, frequency_size=257, dmsteps=3, output_dtype="float32"
+    )
+    observation = np.full((500, len(frequencies)), 5, dtype=np.uint8)
+    center = int(np.floor(cand.tcand / cand.native_tsamp))
+    sources = center + plan.ft_delays
+    assert sources.max() >= plan.output_start + plan.native_count
+    observation[sources, np.arange(plan.nchans)] += 25
+    reads = []
+
+    def read(nstart, nsamp):
+        reads.append((nstart, nsamp))
+        return observation[nstart : nstart + nsamp].copy()
+
+    cand.get_data = read
+    serial = process_cpu(cand, plan, threads=1)
+    assert reads == [(plan.read_start, plan.read_stop - plan.read_start)]
+    data = read_plan_data(cand, plan)
+    expected_data = data.copy()
+    expected_data[:, killed] = 0
+    expected = _direct_numpy_products(expected_data, plan)
+    parallel = process_cpu(cand, plan, data, threads=4)
+    for got, threaded, want in zip(serial, parallel, expected):
+        np.testing.assert_array_equal(got, threaded)
+        np.testing.assert_allclose(got, want, rtol=2e-4, atol=2e-4)
+    assert np.argmax(serial[0].mean(axis=1)) == 4
+    assert np.unravel_index(np.argmax(serial[1]), serial[1].shape) == (1, 4)
+    if gpu_available():
+        gpu = process_gpu(cand, plan, data=data)
+        for got, want in zip(gpu, serial):
+            np.testing.assert_allclose(got, want, rtol=2e-4, atol=2e-4)
+
+
+def test_cpu_port_preserves_fractional_eof_padding_without_wrapping(monkeypatch):
+    from your.utils import candidate_pipeline
+    from your.utils.gpu import gpu_available, process_gpu
+
+    cand = _candidate(np.linspace(1500.0, 1200.0, 257), tcand=0.1, dm=20)
+    plan = make_plan(
+        cand, time_size=8, frequency_size=257, dmsteps=3, output_dtype="float32"
+    )
+    cand.your_header.nspectra = plan.output_start + plan.native_count
+    plan = make_plan(
+        cand, time_size=8, frequency_size=257, dmsteps=3, output_dtype="float32"
+    )
+    assert plan.pad_after > 0
+    data = np.full((plan.read_stop - plan.read_start, plan.nchans), 5, dtype=np.uint8)
+    assert len(data) == 8
+    data[:, -1] = [100, 5, 6, 5, 6, 5, 6, 5]
+    assert np.median(data[:, -1]) == 5.5
+    assert plan.ft_delays[-1] >= len(data)
+    native = candidate_pipeline._rust_candidate_binned
+    raw_ft = []
+
+    def capture(*args, **kwargs):
+        result = native(*args, **kwargs)
+        raw_ft.append(result[0].copy())
+        return result
+
+    monkeypatch.setattr(candidate_pipeline, "_rust_candidate_binned", capture)
+    expected = _direct_numpy_products(data, plan)
+    actual = process_cpu(cand, plan, data, threads=4)
+    np.testing.assert_array_equal(raw_ft[0][:, -1], np.full(8, 5.5))
+    for got, want in zip(actual, expected):
+        np.testing.assert_allclose(got, want, rtol=2e-4, atol=2e-4)
+    if gpu_available():
+        gpu = process_gpu(cand, plan, data=data)
+        for got, want in zip(gpu, actual):
+            np.testing.assert_allclose(got, want, rtol=2e-4, atol=2e-4)
+
+
 def _direct_numpy_products(data, plan):
     real = np.asarray(data, dtype=np.float64)
     medians = np.median(real, axis=0) if len(real) else np.zeros(plan.nchans)
@@ -536,6 +617,127 @@ def test_cpu_native_kernels_match_independent_nonwrapping_numpy_reference():
     np.testing.assert_array_equal(actual[1], expected[1])
 
 
+def test_cpu_integer_binned_path_matches_reference_and_applies_kill_mask(
+    monkeypatch,
+):
+    from your.utils import candidate_pipeline
+
+    cand = _candidate(
+        (1400.0, 1200.0, 1000.0),
+        width=5,
+        dm=0.3,
+        kill_mask=np.array([False, True, False]),
+    )
+    plan = make_plan(
+        cand, time_size=9, frequency_size=3, dmsteps=5, output_dtype="float32"
+    )
+    rng = np.random.default_rng(7)
+    data = rng.integers(
+        0, 64, size=(plan.read_stop - plan.read_start, plan.nchans), dtype=np.uint8
+    )
+    expected_data = data.copy()
+    expected_data[:, 1] = 0
+    expected = _direct_numpy_products(expected_data, plan)
+
+    native_binned = candidate_pipeline._rust_candidate_binned
+    calls = []
+
+    def record_binned(*args, **kwargs):
+        calls.append(kwargs.get("enabled"))
+        return native_binned(*args, **kwargs)
+
+    def unexpected_legacy_call(*args, **kwargs):
+        raise AssertionError("integer candidate should use the binned native path")
+
+    monkeypatch.setattr(candidate_pipeline, "_rust_candidate_binned", record_binned)
+    monkeypatch.setattr(candidate_pipeline, "_rust_dedisperse", unexpected_legacy_call)
+    monkeypatch.setattr(
+        candidate_pipeline, "_rust_dedispersets", unexpected_legacy_call
+    )
+
+    actual = process_cpu(cand, plan, data)
+
+    assert len(calls) == 1
+    np.testing.assert_array_equal(calls[0], [True, False, True])
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=1e-4, atol=1e-5)
+
+
+def test_cpu_integer_binned_path_preserves_padding_and_rfi_mask(monkeypatch):
+    from your.utils import candidate_pipeline
+
+    cand = _candidate(
+        (1400.0, 1200.0, 1000.0),
+        nspectra=12,
+        tcand=0.003,
+        width=5,
+        dm=0.3,
+        kill_mask=np.array([False, True, False]),
+        flag_rfi=True,
+    )
+    plan = make_plan(
+        cand, time_size=9, frequency_size=3, dmsteps=5, output_dtype="float32"
+    )
+    assert plan.pad_before > 0 and plan.pad_after > 0
+    rng = np.random.default_rng(11)
+    data = rng.integers(
+        0, 64, size=(plan.read_stop - plan.read_start, plan.nchans), dtype=np.int16
+    )
+    expected_data = data.copy()
+    expected_data[:, 1:] = 0
+    expected = _direct_numpy_products(expected_data, plan)
+
+    def reject_last_channel(*, data, **kwargs):
+        assert np.all(data[:, 1] == 0)
+        return np.array([False, False, True])
+
+    monkeypatch.setattr(candidate_pipeline, "sk_sg_filter", reject_last_channel)
+    actual = process_cpu(cand, plan, data)
+
+    np.testing.assert_array_equal(cand.rfi_mask, [False, False, True])
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("layout", ["unaligned", "byteswapped"])
+def test_cpu_integer_fast_path_prepares_unaligned_or_byteswapped_input(
+    monkeypatch, layout
+):
+    from your.utils import candidate_pipeline
+
+    cand = _candidate((1400.0, 1200.0, 1000.0), width=5, dm=0.3)
+    plan = make_plan(
+        cand, time_size=9, frequency_size=3, dmsteps=5, output_dtype="float32"
+    )
+    values = np.arange(
+        (plan.read_stop - plan.read_start) * plan.nchans, dtype=np.int16
+    ).reshape(-1, plan.nchans)
+    if layout == "unaligned":
+        buffer = np.empty(values.nbytes + 1, dtype=np.uint8)
+        buffer[1:] = values.view(np.uint8).reshape(-1)
+        data = np.ndarray(values.shape, dtype=values.dtype, buffer=buffer, offset=1)
+        assert not data.flags.aligned
+    else:
+        data = values.astype(values.dtype.newbyteorder("S"))
+        assert not data.dtype.isnative
+
+    expected = _direct_numpy_products(data, plan)
+    native_binned = candidate_pipeline._rust_candidate_binned
+    seen = []
+
+    def record_binned(array, *args, **kwargs):
+        seen.append((array.dtype, array.flags.aligned, array.dtype.isnative))
+        return native_binned(array, *args, **kwargs)
+
+    monkeypatch.setattr(candidate_pipeline, "_rust_candidate_binned", record_binned)
+
+    actual = process_cpu(cand, plan, data)
+
+    assert seen and seen[0] == (np.dtype(np.float64), True, True)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=1e-4, atol=1e-5)
+
+
 def test_process_cpu_profiles_read_prepare_kernels_binning_and_host_finish():
     cand = _candidate(frequencies=(1000.0, 1400.0), dm=0.0)
     plan = make_plan(cand, time_size=5, frequency_size=3, dmsteps=2)
@@ -557,11 +759,20 @@ def test_process_cpu_profiles_read_prepare_kernels_binning_and_host_finish():
     assert all(np.isfinite(value) and value >= 0 for value in profile.values())
 
 
-def test_float64_values_beyond_float32_range_stay_finite():
+def test_float64_values_beyond_float32_range_stay_finite(monkeypatch):
+    from your.utils import candidate_pipeline
+
     cand = _candidate(frequencies=(1000.0, 1400.0), dm=0.0)
     plan = make_plan(cand, time_size=5, frequency_size=3, dmsteps=1)
     data = np.full((plan.read_stop - plan.read_start, 2), 1e300, dtype=np.float64)
     data[2, 0] = 0
+
+    def unexpected_binned_call(*args, **kwargs):
+        raise AssertionError("large floats must use the safe native fallback")
+
+    monkeypatch.setattr(
+        candidate_pipeline, "_rust_candidate_binned", unexpected_binned_call
+    )
 
     ft, dmt = process_cpu(cand, plan, data)
 

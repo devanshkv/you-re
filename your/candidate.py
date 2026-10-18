@@ -450,6 +450,7 @@ class Candidate(Your):
         dmsteps=256,
         output_dtype="float16",
         profile=None,
+        cpu_threads=1,
     ):
         """Produce fixed-size, non-circular, detrended candidate products."""
         from your.utils.candidate_pipeline import make_plan, process_cpu
@@ -457,7 +458,7 @@ class Candidate(Your):
         self._update_id()
         plan = make_plan(self, time_size, frequency_size, dmsteps, output_dtype)
         if target == "CPU":
-            ft, dmt = process_cpu(self, plan, profile=profile)
+            ft, dmt = process_cpu(self, plan, profile=profile, threads=cpu_threads)
         elif target == "GPU":
             from your.utils.candidate_pipeline import read_plan_data
             from your.utils.gpu import _cupy, estimate_process_gpu_bytes, process_gpu

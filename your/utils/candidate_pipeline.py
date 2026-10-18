@@ -9,9 +9,11 @@ import numpy as np
 from scipy.signal import detrend
 from skimage.transform import resize
 
+from your._rust import candidate_binned as _rust_candidate_binned
 from your._rust import dedisperse as _rust_dedisperse
 from your._rust import dedispersets as _rust_dedispersets
 from your.utils.candidate_contract import parse_kill_mask
+from your.utils.misc import _anti_aliased_shrink
 from your.utils.rfi import sk_sg_filter
 
 
@@ -266,8 +268,11 @@ def _apply_candidate_masks(data, cand, plan):
 
 
 def _finite_float32(data, name):
-    array = _numeric_array(data, name).astype(np.float64, copy=False)
     limit = np.finfo(np.float32).max
+    array = _numeric_array(data, name)
+    if array.dtype == np.float32:
+        return np.nan_to_num(array, copy=True, nan=0.0, posinf=limit, neginf=-limit)
+    array = array.astype(np.float64, copy=False)
     array = np.nan_to_num(array, copy=True, nan=0.0, posinf=limit, neginf=-limit)
     np.clip(array, -limit, limit, out=array)
     return array.astype(np.float32)
@@ -279,6 +284,56 @@ def product_input_scale(max_abs):
     if np.isfinite(maximum) and maximum > 1e10:
         return maximum
     return 1.0
+
+
+def _can_use_binned_candidate(data, logical, maximum, input_scale, plan):
+    """Keep the prefix path to integer inputs with bounded accumulation error."""
+    if data.dtype.kind not in "biu" or input_scale != 1.0:
+        return False
+    if maximum * plan.nchans > 2**24 or logical.shape[0] * maximum > 2**52:
+        return False
+    if maximum <= 255:
+        return True
+    span = float(np.max(logical) - np.min(logical))
+    return span == 0.0 or maximum <= span * 512.0
+
+
+def _direct_integer_mask(data, cand, plan):
+    """Return enabled channels when integer input needs no preparation copy."""
+    if (
+        data.dtype.kind not in "biu"
+        or not data.flags.aligned
+        or not data.dtype.isnative
+        or getattr(cand, "flag_rfi", False)
+        or plan.pad_before
+        or plan.pad_after
+        or plan.read_start != plan.required_start
+        or plan.read_stop != plan.required_stop
+    ):
+        return None
+
+    kill_mask = parse_kill_mask(
+        getattr(cand, "kill_mask", np.array([False])), plan.nchans
+    )
+    if data.dtype.kind == "b":
+        maximum, span = 1, 1
+    elif data.dtype.itemsize == 1:
+        bounds = np.iinfo(data.dtype)
+        maximum = max(abs(int(bounds.min)), abs(int(bounds.max)))
+        span = 1
+    elif data.size:
+        low, high = int(np.min(data)), int(np.max(data))
+        maximum = max(abs(low), abs(high))
+        span = high - low
+    else:
+        maximum = span = 0
+    if (
+        maximum * plan.nchans > 2**24
+        or data.shape[0] * maximum > 2**52
+        or (span != 0 and maximum > span * 512)
+    ):
+        return None
+    return np.logical_not(kill_mask)
 
 
 def _normalize(data, dtype):
@@ -295,28 +350,46 @@ def _normalize(data, dtype):
     return normalized.astype(dtype)
 
 
-def finish_products(ft, dmt, plan, profile=None):
-    """Resize, detrend, normalize, and cast time-binned CPU/GPU products."""
+def _resize_ft(ft, frequency_size):
+    """Resize a finite FP32 time-major FT plane and return frequency-major data."""
+    if frequency_size == ft.shape[1]:
+        return np.array(ft.T, dtype=np.float32, copy=True)
+    shrunk = _anti_aliased_shrink(ft, frequency_size)
+    if shrunk is not None:
+        return shrunk.T
+    return resize(
+        ft.T,
+        (frequency_size, ft.shape[0]),
+        anti_aliasing=True,
+        mode="constant",
+        preserve_range=True,
+    ).astype(np.float32, copy=False)
+
+
+def finish_products(ft, dmt, plan, profile=None, *, ft_resized=False):
+    """Finish products, optionally taking FT data that has already been resized."""
     ft = _finite_float32(ft, "FT products")
     dmt = _finite_float32(dmt, "DMT products")
-    if ft.shape != (plan.time_size, plan.nchans):
+    expected_ft_shape = (
+        (plan.frequency_size, plan.time_size)
+        if ft_resized
+        else (plan.time_size, plan.nchans)
+    )
+    if ft.shape != expected_ft_shape:
+        if ft_resized:
+            raise ValueError(
+                "pre-resized FT products must have shape (frequency_size, time_size)"
+            )
         raise ValueError("FT products must have shape (time_size, nchans)")
     if dmt.shape != (plan.dmsteps, plan.time_size):
         raise ValueError("DMT products must have shape (dmsteps, time_size)")
 
     if profile is not None:
         started = perf_counter()
-    ft_frequency_time = ft.T
-    if plan.frequency_size == plan.nchans:
-        ft_frequency_time = np.array(ft_frequency_time, dtype=np.float32, copy=True)
+    if ft_resized:
+        ft_frequency_time = np.array(ft, dtype=np.float32, copy=True)
     else:
-        ft_frequency_time = resize(
-            ft_frequency_time,
-            (plan.frequency_size, plan.time_size),
-            anti_aliasing=True,
-            mode="constant",
-            preserve_range=True,
-        ).astype(np.float32, copy=False)
+        ft_frequency_time = _resize_ft(ft, plan.frequency_size)
     if profile is not None:
         profile["resize_seconds"] = perf_counter() - started
 
@@ -346,8 +419,9 @@ def finish_products(ft, dmt, plan, profile=None):
     return ft_finished, dmt_finished
 
 
-def process_cpu(cand, plan, data=None, profile=None):
-    """Build finished products with direct indexing and native FP32 accumulation."""
+def process_cpu(cand, plan, data=None, profile=None, *, threads=1):
+    """Build nonwrapping products, using bounded Rust threads for integer input."""
+    threads = _positive_index(threads, "CPU threads")
     if profile is not None:
         started = perf_counter()
     if data is None:
@@ -361,6 +435,32 @@ def process_cpu(cand, plan, data=None, profile=None):
 
     if profile is not None:
         started = perf_counter()
+    direct_enabled = _direct_integer_mask(data, cand, plan)
+    if direct_enabled is not None:
+        if profile is not None:
+            profile["prepare_seconds"] = perf_counter() - started
+            profile["scale_seconds"] = 0.0
+            started = perf_counter()
+        source_offset = plan.output_start - plan.required_start
+        if source_offset < 0:
+            raise ValueError("planned source samples escape the padded logical input")
+        ft, dmt = _rust_candidate_binned(
+            data,
+            plan.delays,
+            plan.ft_delays,
+            source_offset,
+            plan.time_bin,
+            plan.time_size,
+            enabled=direct_enabled,
+            threads=threads,
+        )
+        if profile is not None:
+            profile["dedisp_seconds"] = perf_counter() - started
+            started = perf_counter()
+        if profile is not None:
+            profile["bin_seconds"] = perf_counter() - started
+        return finish_products(ft, dmt, plan, profile=profile)
+
     real = data.astype(np.float64, copy=False)
     medians = _channel_medians(real, plan.nchans)
     logical = np.empty(
@@ -397,36 +497,47 @@ def process_cpu(cand, plan, data=None, profile=None):
     if profile is not None:
         profile["prepare_seconds"] = perf_counter() - started
 
+    use_binned = _can_use_binned_candidate(data, logical, maximum, input_scale, plan)
     if profile is not None:
         started = perf_counter()
-    ft_native = _rust_dedisperse(
-        logical,
-        np.asarray(-plan.ft_delays, dtype=np.int64),
-        source_offset,
-        source_offset + plan.native_count,
-    )
-    dmt_native = np.empty((plan.dmsteps, plan.native_count), dtype=np.float32)
-    for dm_index, dm_delays in enumerate(plan.delays):
-        dmt_native[dm_index] = _rust_dedispersets(
+    if use_binned:
+        ft, dmt = _rust_candidate_binned(
             logical,
-            np.asarray(-dm_delays, dtype=np.int64),
+            plan.delays,
+            plan.ft_delays,
+            source_offset,
+            plan.time_bin,
+            plan.time_size,
+            threads=threads,
+        )
+    else:
+        ft_native = _rust_dedisperse(
+            logical,
+            np.asarray(-plan.ft_delays, dtype=np.int64),
             source_offset,
             source_offset + plan.native_count,
         )
+        dmt_native = np.empty((plan.dmsteps, plan.native_count), dtype=np.float32)
+        for dm_index, dm_delays in enumerate(plan.delays):
+            dmt_native[dm_index] = _rust_dedispersets(
+                logical,
+                np.asarray(-dm_delays, dtype=np.int64),
+                source_offset,
+                source_offset + plan.native_count,
+            )
     if profile is not None:
         profile["dedisp_seconds"] = perf_counter() - started
 
     if profile is not None:
         started = perf_counter()
-    ft = ft_native.reshape(plan.time_size, plan.time_bin, plan.nchans).mean(
-        axis=1, dtype=np.float32
-    )
-    dmt_native /= np.float32(plan.nchans)
-    dmt = dmt_native.reshape(plan.dmsteps, plan.time_size, plan.time_bin).mean(
-        axis=2, dtype=np.float32
-    )
-    ft = _finite_float32(ft, "FT products")
-    dmt = _finite_float32(dmt, "DMT products")
+    if not use_binned:
+        ft = ft_native.reshape(plan.time_size, plan.time_bin, plan.nchans).mean(
+            axis=1, dtype=np.float32
+        )
+        dmt_native /= np.float32(plan.nchans)
+        dmt = dmt_native.reshape(plan.dmsteps, plan.time_size, plan.time_bin).mean(
+            axis=2, dtype=np.float32
+        )
     if profile is not None:
         profile["bin_seconds"] = perf_counter() - started
 

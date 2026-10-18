@@ -6,6 +6,35 @@ import pytest
 from your.utils.candidate_contract import decoded_sample_dtype, parse_kill_mask
 
 
+def test_cpu_candmaker_divides_affinity_threads_between_workers(monkeypatch):
+    import os
+    import runpy
+    from pathlib import Path
+
+    cli = runpy.run_path(str(Path(__file__).parents[1] / "bin" / "your_candmaker.py"))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _: set(range(6)), raising=False)
+    assert cli["worker_threads"](2) == 3
+    assert cli["worker_threads"](11) == 1
+    captured = {}
+
+    def make_products(**kwargs):
+        captured.update(kwargs)
+        return "processed"
+
+    args = SimpleNamespace(
+        opt_dm=False,
+        time_size=9,
+        frequency_size=17,
+        dmsteps=3,
+        output_dtype="float32",
+        nproc=2,
+    )
+    result = cli["cpu_dedisp_dmt"](SimpleNamespace(make_products=make_products), args)
+    assert result == "processed"
+    assert captured["target"] == "CPU"
+    assert captured["cpu_threads"] == 3
+
+
 @pytest.mark.parametrize(
     "mask",
     [np.array([], dtype=bool), np.array([False]), np.array(False)],
