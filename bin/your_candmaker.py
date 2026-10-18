@@ -521,6 +521,7 @@ if __name__ == "__main__":
             output_dir=values.fout,
             memory_budget_bytes=budget,
             max_inflight=values.gpu_inflight,
+            in_process=(len(values.gpu_id) == 1),
         )
         if values.profile_json:
             import json

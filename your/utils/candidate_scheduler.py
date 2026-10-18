@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
@@ -757,6 +758,25 @@ def _clear_exception_tracebacks(error: BaseException) -> None:
 
 
 def _run_batch(cp, process_gpu, base, batch, resident, device, max_inflight):
+    if len(batch.jobs) == 1:
+        job = batch.jobs[0]
+        try:
+            candidate, profile, process_seconds = _run_gpu_job(
+                cp,
+                process_gpu,
+                base,
+                job,
+                resident.array,
+                resident.start,
+                device,
+            )
+        except BaseException as exc:
+            if not _is_out_of_memory(exc):
+                raise
+            _clear_exception_tracebacks(exc)
+            raise MemoryError(str(exc)) from None
+        return {job.index: (job, candidate, profile, process_seconds)}
+
     results = {}
     errors = []
     worker_count = min(max_inflight, len(batch.jobs))
@@ -1087,6 +1107,77 @@ def _gpu_worker(
         )
 
 
+def _run_jobs_in_process(
+    jobs,
+    assigned,
+    device,
+    output_dir,
+    memory_budget_bytes,
+    safety_fraction,
+    max_inflight,
+):
+    work = iter(assigned)
+    messages = []
+    job_queue = SimpleNamespace(get=lambda: next(work, None))
+    result_queue = SimpleNamespace(put=messages.append)
+    _gpu_worker(
+        device,
+        job_queue,
+        result_queue,
+        output_dir,
+        memory_budget_bytes,
+        safety_fraction,
+        max_inflight,
+    )
+
+    reports = {}
+    completed = False
+    for message in messages:
+        if message["type"] == "result":
+            index = int(message["index"])
+            if index in reports:
+                raise RuntimeError(
+                    f"GPU workers returned duplicate candidate index {index}"
+                )
+            reports[index] = message
+        elif message["type"] == "error":
+            location = (
+                f"candidate {message['index']}"
+                if message["index"] is not None
+                else "worker startup"
+            )
+            raise RuntimeError(
+                f"GPU {message['device']} failed during {location}: "
+                f"{message['error']}\n"
+                f"{message['traceback']}"
+            )
+        elif message["type"] == "done":
+            if message["device"] != device:
+                raise RuntimeError(
+                    f"GPU worker {device} reported completion for GPU "
+                    f"{message['device']}"
+                )
+            if completed:
+                raise RuntimeError(f"GPU worker {device} reported completion twice")
+            completed = True
+
+    if not completed:
+        raise RuntimeError(f"GPU worker {device} exited before reporting completion")
+    expected = {job.index for job in jobs}
+    missing = sorted(expected - reports.keys())
+    if missing:
+        raise RuntimeError(
+            f"GPU workers completed without reports for candidate indices {missing}"
+        )
+    unexpected = sorted(reports.keys() - expected)
+    if unexpected:
+        raise RuntimeError(
+            f"GPU workers returned reports for unexpected candidate indices "
+            f"{unexpected}"
+        )
+    return [reports[index] for index in sorted(reports)]
+
+
 def run_jobs(
     jobs: Iterable[CandidateJob],
     *,
@@ -1096,23 +1187,31 @@ def run_jobs(
     safety_fraction: float = 0.8,
     max_inflight: int = 2,
     output_callback: Callable[[dict[str, Any]], None] | None = None,
+    in_process: bool = False,
 ) -> list[dict[str, Any]]:
-    """Run candidate jobs in one spawned process per requested GPU.
+    """Run candidate jobs in one spawned process per requested GPU by default.
 
     Output HDF5 files are written by a bounded, single-thread writer per GPU process.
     ``output_callback`` runs in the parent process and receives each completed report.
+    ``in_process`` opts into a single-GPU worker in the calling process.
     """
     jobs = list(jobs)
-    if not jobs:
+    if not jobs and not in_process:
         return []
     gpu_ids = tuple(int(gpu_id) for gpu_id in gpu_ids)
     if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids) or min(gpu_ids) < 0:
         raise ValueError("gpu_ids must contain distinct non-negative device IDs")
+    if in_process and len(gpu_ids) != 1:
+        raise ValueError("in_process requires exactly one GPU ID")
+    if in_process and output_callback is not None:
+        raise ValueError("output_callback is only supported with spawned workers")
     if max_inflight < 1:
         raise ValueError("max_inflight must be at least one")
     if memory_budget_bytes is not None and memory_budget_bytes < 1:
         raise ValueError("memory_budget_bytes must be positive")
     choose_memory_budget(1, safety_fraction)
+    if not jobs:
+        return []
     _preflight_output_paths(jobs, output_dir)
     if output_dir is not None:
         output_dir = os.fspath(output_dir)
@@ -1120,6 +1219,17 @@ def run_jobs(
 
     groups = group_jobs_by_files(jobs)
     assigned = _assign_work(groups, gpu_ids)
+    if in_process:
+        return _run_jobs_in_process(
+            jobs,
+            assigned[gpu_ids[0]],
+            gpu_ids[0],
+            output_dir,
+            memory_budget_bytes,
+            safety_fraction,
+            max_inflight,
+        )
+
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     workers = {}

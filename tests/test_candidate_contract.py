@@ -99,8 +99,9 @@ def test_decoded_sample_dtype_uses_zero_length_fallbacks_without_reading():
     assert decoded_sample_dtype(generic) == np.dtype(np.uint16)
 
 
+@pytest.mark.parametrize(("gpu_ids", "in_process"), [([0], True), ([0, 1], False)])
 def test_candmaker_parent_uses_compact_plans_and_preserves_csv_width(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, gpu_ids, in_process
 ):
     import csv
     import runpy
@@ -162,7 +163,8 @@ def test_candmaker_parent_uses_compact_plans_and_preserves_csv_width(
 
     def capture_jobs(planned_jobs, **kwargs):
         assert full_calls == []
-        assert kwargs["gpu_ids"] == [0]
+        assert kwargs["gpu_ids"] == gpu_ids
+        assert kwargs["in_process"] is in_process
         jobs.extend(planned_jobs)
         return []
 
@@ -178,7 +180,7 @@ def test_candmaker_parent_uses_compact_plans_and_preserves_csv_width(
             "-c",
             str(csv_path),
             "-g",
-            "0",
+            *[str(gpu_id) for gpu_id in gpu_ids],
             "-o",
             str(tmp_path),
             "--time_size",

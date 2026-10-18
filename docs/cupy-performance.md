@@ -269,6 +269,51 @@ Raw run commands, output counts, timings, fallback counts and byte totals are in
 hashes and source-manifest hashes; `run.py` is the direct-subprocess driver.
 The original 380-candidate observation was not benchmarked.
 
+## Single-GPU CLI scheduling follow-up
+
+Profiling the 32 real Lovell candidates found 0.105 s of dedispersion inside a
+9.50 s CLI run. The spawned GPU worker repeated about 1.4 s of scientific-stack
+imports and exchanged file groups through process queues. Every singleton batch
+also created and shut down a thread pool.
+
+The single-GPU CLI now runs the existing worker in the CLI process. Singleton
+batches call the existing GPU job runner directly. The library's default and
+multi-GPU runs retain spawned workers; explicit in-process calls require one GPU
+and no output callback. GPU kernels, real right-hand samples, resizing,
+detrending and output precision defaults are unchanged.
+
+Against main `1f9b0b2` and the original CuPy branch `6be5d48`, fresh measurements
+on the same V100 and six CPU cores gave these end-to-end medians:
+
+| Dataset | Main GPU FP32 | Original CuPy GPU FP32 | Fixed CuPy GPU FP32 | Fixed default FP16 |
+| --- | ---: | ---: | ---: | ---: |
+| 32 real candidates, 31 files | 7.188 s | 9.000 s | 5.880 s | 5.724 s |
+| 120 synthetic candidates, one file | 13.212 s | 15.284 s | 13.474 s | 14.133 s |
+
+Matched FP32 uses 34.7% less time than the original CuPy path on the real data
+and 18.2% less than main. On the larger synthetic batch it uses 11.8% less time
+than the original and 2.0% more than main. Default FP16 did not improve the
+synthetic end-to-end time despite its smaller output files.
+
+Each number is the median of three fresh CLI runs after an untimed full-data
+warmup. Main/original/fixed order rotated across repeats, and supplementary FP16
+runs followed. Settings remained `-n 2`, 256 by 256 output, 256 DM trials and two
+in-flight CuPy candidates. Timers include launch through exit, imports, reads,
+transfers, finishing and gzip-9 HDF5 output. Validation is outside the timer.
+The real files have 800 or 672 uint8 channels and 256 us sampling; the synthetic
+fixture is unchanged from the earlier comparison.
+
+All 24 measured runs and six warmups passed: 1,824 measured and 2,280 total
+outputs validated. Main logged no CPU fallbacks. All 456 original/fixed FP32
+candidate pairs were bitwise identical across both datasets and three repeats.
+The full Python suite passed 481 tests; scoped lint, formatting and independent
+review passed. Physical multi-GPU execution was not benchmarked.
+
+Raw commands, logs, products, fingerprints and timings are in
+`/tmp/you-re-gpu-fixed-comparison`; diagnostics are in
+`/tmp/you-re-gpu-investigation`. The real-data report and JSON are saved beside
+the inputs as `/home/riftuser/data/R1_gpu_optimization.{md,json}`.
+
 ## Remaining opportunities
 
 After arithmetic and launch improvements, measure CPU finishing and compressed

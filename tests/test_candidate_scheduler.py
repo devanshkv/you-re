@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import your.utils.candidate_scheduler as scheduler
 from your.utils.candidate_scheduler import (
     CandidateBatch,
     CandidateJob,
@@ -648,6 +649,91 @@ def test_queued_save_uses_preflighted_filename():
     assert report["output_file"].endswith("stable-candidate.h5")
 
 
+def test_run_jobs_in_process_returns_sorted_results(monkeypatch):
+    def inline_worker(device, job_queue, result_queue, *_args):
+        work = []
+        while (item := job_queue.get()) is not None:
+            work.append(item)
+        assert len(work) == 1
+        for index in (1, 0):
+            result_queue.put({"type": "result", "device": device, "index": index})
+        result_queue.put({"type": "done", "device": device})
+
+    monkeypatch.setattr(scheduler, "_gpu_worker", inline_worker)
+    reports = scheduler.run_jobs(
+        [job(1, (0, 1), (0, 1)), job(0, (1, 2), (1, 2))],
+        gpu_ids=[3],
+        in_process=True,
+    )
+
+    assert [report["index"] for report in reports] == [0, 1]
+
+
+def test_run_jobs_in_process_reports_worker_errors(monkeypatch):
+    def inline_worker(device, _job_queue, result_queue, *_args):
+        result_queue.put(
+            {
+                "type": "error",
+                "device": device,
+                "index": 0,
+                "error": "synthetic worker failure",
+                "traceback": "worker traceback",
+            }
+        )
+
+    monkeypatch.setattr(scheduler, "_gpu_worker", inline_worker)
+    with pytest.raises(RuntimeError, match="GPU 2 failed during candidate 0"):
+        scheduler.run_jobs([job(0, (0, 1), (0, 1))], gpu_ids=[2], in_process=True)
+
+
+@pytest.mark.parametrize(
+    ("messages", "error"),
+    [
+        (
+            [
+                {"type": "result", "index": 0},
+                {"type": "result", "index": 0},
+                {"type": "done"},
+            ],
+            "duplicate candidate index 0",
+        ),
+        (
+            [{"type": "result", "index": 0}, {"type": "done"}],
+            r"without reports for candidate indices \[1\]",
+        ),
+        ([{"type": "result", "index": 0}], "before reporting completion"),
+    ],
+    ids=["duplicate-result", "missing-result", "missing-completion"],
+)
+def test_run_jobs_in_process_guards_completion(monkeypatch, messages, error):
+    def inline_worker(device, job_queue, result_queue, *_args):
+        while job_queue.get() is not None:
+            pass
+        for message in messages:
+            result_queue.put({"device": device, **message})
+
+    monkeypatch.setattr(scheduler, "_gpu_worker", inline_worker)
+    with pytest.raises(RuntimeError, match=error):
+        scheduler.run_jobs(
+            [job(0, (0, 1), (0, 1)), job(1, (1, 2), (1, 2))],
+            gpu_ids=[0],
+            in_process=True,
+        )
+
+
+def test_run_jobs_in_process_requires_one_gpu_and_no_callback():
+    candidate_job = job(0, (0, 1), (0, 1))
+    with pytest.raises(ValueError, match="exactly one GPU ID"):
+        scheduler.run_jobs([candidate_job], gpu_ids=[0, 1], in_process=True)
+    with pytest.raises(ValueError, match="output_callback"):
+        scheduler.run_jobs(
+            [candidate_job],
+            gpu_ids=[0],
+            output_callback=lambda _report: None,
+            in_process=True,
+        )
+
+
 def test_run_jobs_failure_does_not_wait_for_unconsumed_queue_payload(tmp_path):
     from pathlib import Path
 
@@ -830,6 +916,80 @@ def test_oom_serial_retry_releases_failed_future_temporaries(monkeypatch):
     assert set(results) == {0, 1}
     assert all(result[2]["oom_serial_retry"] == 1 for result in results.values())
     assert all(reference() is None for reference in refs)
+
+
+def test_single_job_batch_skips_executor(monkeypatch):
+    class Resident:
+        array = object()
+        start = 3
+
+    candidate_job = job(0, (0, 1), (0, 1))
+    candidate = object()
+    profile = {"processed": True}
+
+    def run_job(_cp, _process_gpu, _base, actual_job, resident, start, device):
+        assert actual_job is candidate_job
+        assert resident is Resident.array
+        assert (start, device) == (3, 2)
+        return candidate, profile, 0.25
+
+    def unexpected_executor(*_args, **_kwargs):
+        raise AssertionError("singleton batches must not create an executor")
+
+    monkeypatch.setattr(scheduler, "_run_gpu_job", run_job)
+    monkeypatch.setattr(scheduler, "ThreadPoolExecutor", unexpected_executor)
+
+    results = _run_batch(
+        None,
+        None,
+        None,
+        CandidateBatch((candidate_job,), 0, 1, 0, 0),
+        Resident(),
+        2,
+        2,
+    )
+
+    assert results == {0: (candidate_job, candidate, profile, 0.25)}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type"),
+    [
+        (ValueError("synthetic failure"), ValueError),
+        (RuntimeError("cuda out of memory"), MemoryError),
+    ],
+)
+def test_single_job_batch_preserves_errors_without_executor(
+    monkeypatch, error, expected_type
+):
+    class Resident:
+        array = object()
+        start = 0
+
+    candidate_job = job(0, (0, 1), (0, 1))
+
+    def fail(*_args):
+        raise error
+
+    def unexpected_executor(*_args, **_kwargs):
+        raise AssertionError("singleton batches must not create an executor")
+
+    monkeypatch.setattr(scheduler, "_run_gpu_job", fail)
+    monkeypatch.setattr(scheduler, "ThreadPoolExecutor", unexpected_executor)
+    with pytest.raises(expected_type, match=str(error)) as caught:
+        _run_batch(
+            None,
+            None,
+            None,
+            CandidateBatch((candidate_job,), 0, 1, 0, 0),
+            Resident(),
+            0,
+            1,
+        )
+    if isinstance(error, ValueError):
+        assert caught.value is error
+    else:
+        assert error.__traceback__ is None
 
 
 def test_worker_oom_cleanup_drops_temporary_references_from_traceback():
