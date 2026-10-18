@@ -280,6 +280,22 @@ class Writer:
         """
         outfile = os.path.join(self.outdir, self.outname + ".fil")
 
+        if data is None and self.nsamp > 0 and self.gulp <= 0:
+            raise ValueError("gulp must be positive")
+
+        sources = getattr(
+            self.your_object, "your_file", self.your_object.your_header.filename
+        )
+        if isinstance(sources, (str, os.PathLike)):
+            sources = [sources]
+        for source in sources:
+            if os.path.realpath(outfile) == os.path.realpath(source) or (
+                os.path.exists(outfile)
+                and os.path.exists(source)
+                and os.path.samefile(outfile, source)
+            ):
+                raise ValueError("Filterbank output must not overwrite its input")
+
         if self.npoln == 4:
             logger.warning(
                 "npoln can only be 1 for output filterbanks. Setting npoln to 1."
@@ -308,23 +324,31 @@ class Writer:
             if data is None:
                 # get the nstart and number of samples to write
                 start_sample = self.nstart
-                samples_left = self.nsamp
+                available = max(0, self.your_object.your_header.nspectra - start_sample)
+                samples_left = min(self.nsamp, available)
 
                 # open the file
                 with open(outfile, "ab") as f:
                     # read till there are spectra to read
                     while samples_left > 0:
-                        self.get_data_to_write(start_sample, self.gulp)
-                        self.data = self.data.squeeze()
+                        samples_to_read = min(self.gulp, samples_left)
+                        data = self.get_data_to_write(start_sample, samples_to_read)
+                        samples_read = data.shape[0]
+                        if samples_read <= 0:
+                            raise IOError(
+                                "No samples read while writing the filterbank"
+                            )
+                        self.data = data.squeeze()
                         # goto the end of the file and dump
                         f.seek(0, os.SEEK_END)
                         f.write(self.data.ravel())
-                        progress.update(task, advance=self.gulp)
+                        progress.update(task, advance=samples_read)
                         logger.debug(
-                            f"Wrote from spectra {start_sample}-{start_sample + self.gulp} to the filterbank"
+                            f"Wrote from spectra {start_sample}-"
+                            f"{start_sample + samples_read} to the filterbank"
                         )
-                        start_sample += self.gulp
-                        samples_left -= self.gulp
+                        start_sample += samples_read
+                        samples_left -= samples_read
             else:
                 if data.dtype == self.your_object.your_header.dtype:
                     logger.debug(f"write data of shape {data.shape} to {outfile}")

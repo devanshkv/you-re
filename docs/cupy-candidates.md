@@ -76,8 +76,10 @@ kill masks and optional RFI masks do not change with batch composition.
 
 `--gpu_inflight` bounds simultaneous candidate processing (default 2).
 `--gpu_memory_mb` bounds the estimated working set; the default reserves a
-fraction of currently free memory. Estimates include resident input, old plus
-new buffers during overlap reuse, bounded GPU transpose staging, native
+fraction of driver-free memory plus reusable CuPy cache. Scheduled and direct
+GPU processing also respect CuPy pool limits, including `CUPY_GPU_MEMORY_LIMIT`,
+after accounting for active pool allocations. Estimates include resident input,
+old plus new buffers during overlap reuse, bounded GPU transpose staging, native
 intermediates, delay tables, median
 workspace and all in-flight candidates. HDF5 writes use a bounded CPU writer
 queue and can overlap later GPU work. If only the old-plus-new cache replacement
@@ -139,9 +141,10 @@ fixture workloads.
 
 Default filenames include a stable hash of the observation and full candidate
 parameters so different widths, labels, and observations do not overwrite each
-other. Scheduled repeated rows receive distinct names, and destination collisions
-are checked before processing. HDF5 files are written to temporary files in the
-destination directory and atomically published only after a successful close;
+other. Library jobs without explicit filenames append their job index to the
+candidate ID. Scheduled repeated rows receive distinct names, and destination
+collisions are checked before processing. HDF5 files are written to temporary
+files in the destination directory and atomically published only after a successful close;
 a failed save preserves any previous complete file.
 
 Dataset names and axis order remain `data_freq_time[time, frequency]` and

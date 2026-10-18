@@ -1,3 +1,5 @@
+import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -67,6 +69,125 @@ def test_to_fil_joins_directory_without_mutating_name(your_object, tmp_path):
     with Your(str(tmp_path / "read.fil")) as result:
         assert result.your_header.nspectra == 2
         np.testing.assert_array_equal(result.get_data(0, 2), your_object.get_data(0, 2))
+
+
+@pytest.mark.parametrize("alias_kind", ("same_path", "symlink", "hardlink"))
+def test_to_fil_rejects_input_aliases_without_truncating_source(tmp_path, alias_kind):
+    source = tmp_path / "source.fil"
+    shutil.copyfile(_FIXTURE, source)
+    before = source.read_bytes()
+
+    if alias_kind == "same_path":
+        output_name = source.stem
+    else:
+        alias = tmp_path / "alias.fil"
+        if alias_kind == "symlink":
+            alias.symlink_to(source)
+        else:
+            os.link(source, alias)
+        output_name = alias.stem
+
+    with Your(str(source)) as source_reader:
+        writer = Writer(
+            source_reader,
+            nsamp=0,
+            gulp=1,
+            outdir=str(tmp_path),
+            outname=output_name,
+            progress=False,
+        )
+        with pytest.raises(ValueError, match="must not overwrite its input"):
+            writer.to_fil()
+
+    assert source.read_bytes() == before
+
+
+def test_to_fil_rejects_member_of_multi_file_input_without_truncating_source(
+    tmp_path,
+):
+    fixture = Path(__file__).parent / "data" / "small.fits"
+    first = tmp_path / "first.fits"
+    second = tmp_path / "second.fits"
+    shutil.copyfile(fixture, first)
+    shutil.copyfile(fixture, second)
+    before = second.read_bytes()
+    (tmp_path / "second.fil").symlink_to(second)
+
+    with Your([str(first), str(second)]) as source_reader:
+        writer = Writer(
+            source_reader,
+            nsamp=0,
+            gulp=1,
+            outdir=str(tmp_path),
+            outname="second",
+            progress=False,
+        )
+        with pytest.raises(ValueError, match="must not overwrite its input"):
+            writer.to_fil()
+
+    assert second.read_bytes() == before
+
+
+def test_to_fil_writes_partial_final_gulp(your_object, tmp_path):
+    writer = Writer(
+        your_object,
+        nstart=1,
+        nsamp=5,
+        gulp=3,
+        outdir=str(tmp_path),
+        outname="partial",
+        progress=False,
+    )
+
+    writer.to_fil()
+
+    with Your(str(tmp_path / "partial.fil")) as result:
+        assert result.your_header.nspectra == 5
+        np.testing.assert_array_equal(result.get_data(0, 5), your_object.get_data(1, 5))
+
+
+@pytest.mark.parametrize("nsamp", (None, 20))
+def test_to_fil_clips_requested_samples_to_input_end(your_object, tmp_path, nsamp):
+    available = your_object.your_header.nspectra - 1
+    requested = your_object.your_header.nspectra if nsamp is None else nsamp
+    expected = min(requested, available)
+    writer = Writer(
+        your_object,
+        nstart=1,
+        nsamp=nsamp,
+        gulp=2,
+        outdir=str(tmp_path),
+        outname="to_end",
+        progress=False,
+    )
+
+    writer.to_fil()
+
+    assert writer.nsamp == requested
+    with Your(str(tmp_path / "to_end.fil")) as result:
+        assert result.your_header.nspectra == expected
+        np.testing.assert_array_equal(
+            result.get_data(0, expected), your_object.get_data(1, expected)
+        )
+
+
+@pytest.mark.parametrize("gulp", (0, -1))
+def test_to_fil_rejects_nonpositive_gulp_before_creating_output(
+    your_object, tmp_path, gulp
+):
+    writer = Writer(
+        your_object,
+        nsamp=1,
+        gulp=gulp,
+        outdir=str(tmp_path),
+        outname="invalid_gulp",
+        progress=False,
+    )
+
+    with pytest.raises(ValueError, match="gulp must be positive"):
+        writer.to_fil()
+
+    assert not (tmp_path / "invalid_gulp.fil").exists()
 
 
 def test_setup_dada_preserves_an_explicit_key(your_object, monkeypatch):

@@ -1,7 +1,7 @@
 import pytest
 
 from your.utils.misc import *
-from your.utils.misc import _anti_aliased_shrink
+from your.utils.misc import _anti_aliased_shrink, _decimate
 
 
 def test_pad_along_axis():
@@ -19,8 +19,24 @@ def test_pad_along_axis():
     assert (d_both[:, 0] - np.median(d, axis=1)).sum() == 0
     assert (d_both[:, -1] - np.median(d, axis=1)).sum() == 0
 
+    d_odd = np.arange(6).reshape(3, 2)
+    d_odd_axis_0 = pad_along_axis(d_odd, 6, "both", 0, mode="median")
+    assert d_odd_axis_0.shape == (6, 2)
+    assert np.array_equal(d_odd_axis_0[1:-2], d_odd)
+
+    d_odd_axis_1 = pad_along_axis(d_odd, 5, "both", 1, mode="median")
+    assert d_odd_axis_1.shape == (3, 5)
+    assert np.array_equal(d_odd_axis_1[:, 1:-2], d_odd)
+
     d_same = pad_along_axis(d, 9, "end", 0, mode="median")
     assert (d_same - d).sum() == 0
+
+
+def test_decimate_with_odd_centered_padding():
+    result = _decimate(np.ones((9, 3)), 2, 0, pad=True, loc="both", mode="median")
+
+    assert result.shape == (5, 3)
+    assert np.array_equal(result, np.ones((5, 3)))
 
 
 def test_crop():

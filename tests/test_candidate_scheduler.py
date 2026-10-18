@@ -3,6 +3,7 @@ import pickle
 import subprocess
 import sys
 import textwrap
+import types
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -55,6 +56,52 @@ def job(index, required, readable, workspace=0, files=("obs.fil",)):
 
 def estimate(plan, _dtype):
     return plan.workspace
+
+
+def _install_fake_cupy(
+    monkeypatch,
+    driver_free_bytes=1000,
+    pool_free_bytes=0,
+    pool_limit=0,
+    pool_used_bytes=0,
+):
+    class Pool:
+        free_calls = 0
+        get_limit_calls = 0
+        used_calls = 0
+        default_pool_calls = 0
+
+        def free_bytes(self):
+            self.free_calls += 1
+            return pool_free_bytes
+
+        def get_limit(self):
+            self.get_limit_calls += 1
+            return pool_limit
+
+        def used_bytes(self):
+            self.used_calls += 1
+            if not pool_limit:
+                raise AssertionError("unlimited pool usage must not be queried")
+            return pool_used_bytes
+
+    pool = Pool()
+
+    def get_default_memory_pool():
+        pool.default_pool_calls += 1
+        return pool
+
+    cupy = types.ModuleType("cupy")
+    cupy.cuda = SimpleNamespace(
+        Device=lambda _device: nullcontext(),
+        runtime=SimpleNamespace(
+            memGetInfo=lambda: (driver_free_bytes, driver_free_bytes * 2)
+        ),
+    )
+    cupy.get_default_memory_pool = get_default_memory_pool
+    cupy.get_default_pinned_memory_pool = lambda: pool
+    monkeypatch.setitem(sys.modules, "cupy", cupy)
+    return pool
 
 
 def test_jobs_group_by_exact_files_and_required_interval():
@@ -592,10 +639,12 @@ def test_hdf5_save_is_queued_without_blocking_gpu_worker():
     release = Event()
 
     class DelayedCandidate:
-        def save_h5(self, out_dir=None):
+        id = "candidate"
+
+        def save_h5(self, out_dir=None, fnout=None):
             started.set()
             release.wait(timeout=1)
-            return "candidate.h5"
+            return fnout
 
     writer = ThreadPoolExecutor(max_workers=1)
     try:
@@ -669,6 +718,57 @@ def test_run_jobs_in_process_returns_sorted_results(monkeypatch):
     assert [report["index"] for report in reports] == [0, 1]
 
 
+def test_run_jobs_default_names_preserve_same_candidate_plans(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    jobs = [
+        CandidateJob(("obs.fil",), {"dm": 1.0}, Plan(0, 1, 0, 1), 0),
+        CandidateJob(("obs.fil",), {"dm": 1.0}, Plan(1, 2, 1, 2), 1),
+    ]
+
+    class Candidate:
+        id = "same-candidate"
+
+        def __init__(self, plan):
+            self.plan = plan
+
+        def save_h5(self, out_dir=None, fnout=None):
+            path = Path(out_dir) / fnout
+            path.write_text(f"{self.plan.required_start}:{self.plan.required_stop}")
+            return str(path)
+
+    def fake_worker(device, job_queue, result_queue, output_dir, *_args):
+        writer = ThreadPoolExecutor(max_workers=1)
+        try:
+            while (work := job_queue.get()) is not None:
+                for candidate_job in work.jobs:
+                    pending = _queue_candidate_save(
+                        writer,
+                        Candidate(candidate_job.plan),
+                        candidate_job,
+                        {},
+                        0.01,
+                        device,
+                        output_dir,
+                    )
+                    result_queue.put(_complete_candidate_save(pending))
+            result_queue.put({"type": "done", "device": device})
+        finally:
+            writer.shutdown(wait=True)
+
+    monkeypatch.setattr(scheduler, "_gpu_worker", fake_worker)
+    reports = scheduler.run_jobs(
+        jobs, gpu_ids=[0], output_dir=tmp_path, in_process=True
+    )
+
+    paths = [Path(report["output_file"]) for report in reports]
+    assert [path.name for path in paths] == [
+        "same-candidate_0.h5",
+        "same-candidate_1.h5",
+    ]
+    assert [path.read_text() for path in paths] == ["0:1", "1:2"]
+
+
 def test_run_jobs_in_process_reports_worker_errors(monkeypatch):
     def inline_worker(device, _job_queue, result_queue, *_args):
         result_queue.put(
@@ -701,9 +801,22 @@ def test_run_jobs_in_process_reports_worker_errors(monkeypatch):
             [{"type": "result", "index": 0}, {"type": "done"}],
             r"without reports for candidate indices \[1\]",
         ),
+        (
+            [
+                {"type": "result", "index": 0},
+                {"type": "result", "index": 2},
+                {"type": "done"},
+            ],
+            r"without reports for candidate indices \[1\]",
+        ),
         ([{"type": "result", "index": 0}], "before reporting completion"),
     ],
-    ids=["duplicate-result", "missing-result", "missing-completion"],
+    ids=[
+        "duplicate-result",
+        "missing-result",
+        "wrong-result-indices",
+        "missing-completion",
+    ],
 )
 def test_run_jobs_in_process_guards_completion(monkeypatch, messages, error):
     def inline_worker(device, job_queue, result_queue, *_args):
@@ -721,6 +834,62 @@ def test_run_jobs_in_process_guards_completion(monkeypatch, messages, error):
         )
 
 
+def test_spawned_run_jobs_rejects_equal_count_wrong_candidate_indices(tmp_path):
+    from pathlib import Path
+
+    repo = Path(__file__).parents[1]
+    script = tmp_path / "wrong_result_indices.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+            import sys
+            sys.path.insert(0, {str(repo)!r})
+
+            import your.utils.candidate_scheduler as scheduler
+            from your.utils.candidate_scheduler import CandidateJob
+
+            class Plan:
+                required_start = 0
+                required_stop = 1
+
+            def wrong_indices_worker(device, job_queue, result_queue, *_args):
+                while job_queue.get() is not None:
+                    pass
+                result_queue.put({{"type": "result", "device": device, "index": 0}})
+                result_queue.put({{"type": "result", "device": device, "index": 2}})
+                result_queue.put({{"type": "done", "device": device}})
+
+            if __name__ == "__main__":
+                scheduler._gpu_worker = wrong_indices_worker
+                jobs = [
+                    CandidateJob(("obs.fil",), {{}}, Plan(), index)
+                    for index in (0, 1)
+                ]
+                try:
+                    scheduler.run_jobs(jobs, gpu_ids=[0])
+                except RuntimeError as error:
+                    print(f"EXPECTED {{error}}", flush=True)
+                else:
+                    print("UNEXPECTED SUCCESS", flush=True)
+            """
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        "EXPECTED GPU workers completed without reports for candidate indices [1]"
+        in completed.stdout
+    )
+
+
 def test_run_jobs_in_process_requires_one_gpu_and_no_callback():
     candidate_job = job(0, (0, 1), (0, 1))
     with pytest.raises(ValueError, match="exactly one GPU ID"):
@@ -732,6 +901,192 @@ def test_run_jobs_in_process_requires_one_gpu_and_no_callback():
             output_callback=lambda _report: None,
             in_process=True,
         )
+
+
+@pytest.mark.parametrize(
+    "interrupt_type",
+    [KeyboardInterrupt, SystemExit],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_run_jobs_in_process_propagates_interrupt_and_shuts_down_writer(
+    monkeypatch, interrupt_type
+):
+    import importlib
+
+    _install_fake_cupy(monkeypatch)
+    candidate_module = importlib.import_module("your.candidate")
+    contract_module = importlib.import_module("your.utils.candidate_contract")
+    failure = interrupt_type("worker interrupted")
+    candidate_job = job(0, (0, 1), (0, 1))
+    closed_candidates = []
+
+    class Candidate:
+        def __init__(self, *_args, **_kwargs):
+            self.your_header = SimpleNamespace(nchans=1)
+
+        def close(self):
+            closed_candidates.append(self)
+
+    class Resident:
+        interval = None
+
+        def __init__(self, *_args):
+            pass
+
+        def ensure(self, *_args):
+            return {
+                "read_bytes": 0,
+                "upload_bytes": 0,
+                "read_s": 0,
+                "upload_s": 0,
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(candidate_module, "Candidate", Candidate)
+    monkeypatch.setattr(
+        contract_module,
+        "decoded_sample_dtype",
+        lambda _candidate: np.dtype(np.uint8),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_ResidentCache",
+        Resident,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "plan_batches",
+        lambda *_args, **_kwargs: [CandidateBatch((candidate_job,), 0, 1, 0, 0)],
+    )
+
+    def interrupt_batch(*_args):
+        raise failure
+
+    monkeypatch.setattr(scheduler, "_run_batch", interrupt_batch)
+    real_executor = scheduler.ThreadPoolExecutor
+    shutdown_calls = []
+
+    class TrackingExecutor(real_executor):
+        def shutdown(self, *args, **kwargs):
+            shutdown_calls.append(kwargs.copy())
+            return super().shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "ThreadPoolExecutor", TrackingExecutor)
+    with pytest.raises(interrupt_type) as caught:
+        scheduler.run_jobs([candidate_job], gpu_ids=[0], in_process=True)
+
+    assert caught.value is failure
+    assert len(closed_candidates) == 1
+    assert shutdown_calls == [{"wait": True, "cancel_futures": True}]
+
+
+@pytest.mark.parametrize(
+    (
+        "pool_free_bytes",
+        "safety_fraction",
+        "pool_limit",
+        "pool_used_bytes",
+        "explicit_budget",
+        "expected",
+    ),
+    [
+        (200, 0.5, 0, 0, None, 600),
+        (200, 1.0, 0, 0, None, 1200),
+        (200, 0.5, 500, 0, None, 500),
+        (200, 0.5, 800, 300, None, 500),
+        (200, 0.5, 800, 300, 250, 250),
+        (200, 0.5, 500, 500, None, None),
+    ],
+    ids=[
+        "unlimited-cached-pool",
+        "unlimited-all-free",
+        "smaller-pool-limit",
+        "active-pool-usage",
+        "explicit-cap",
+        "exhausted-pool-limit",
+    ],
+)
+def test_worker_budget_respects_pool_limit_and_active_bytes(
+    monkeypatch,
+    pool_free_bytes,
+    safety_fraction,
+    pool_limit,
+    pool_used_bytes,
+    explicit_budget,
+    expected,
+):
+    import importlib
+
+    pool = _install_fake_cupy(
+        monkeypatch,
+        pool_free_bytes=pool_free_bytes,
+        pool_limit=pool_limit,
+        pool_used_bytes=pool_used_bytes,
+    )
+    candidate_module = importlib.import_module("your.candidate")
+    contract_module = importlib.import_module("your.utils.candidate_contract")
+    gpu_module = importlib.import_module("your.utils.gpu")
+
+    class Candidate:
+        def __init__(self, *_args, **_kwargs):
+            self.your_header = SimpleNamespace(nchans=1)
+
+        def close(self):
+            pass
+
+    class Resident:
+        interval = None
+
+        def __init__(self, *_args):
+            pass
+
+        def close(self):
+            pass
+
+    budgets = []
+    monkeypatch.setattr(candidate_module, "Candidate", Candidate)
+    monkeypatch.setattr(
+        contract_module,
+        "decoded_sample_dtype",
+        lambda _candidate: np.dtype(np.uint8),
+    )
+    monkeypatch.setattr(gpu_module, "estimate_process_gpu_bytes", lambda *_args: 0)
+    monkeypatch.setattr(scheduler, "_ResidentCache", Resident)
+    monkeypatch.setattr(
+        scheduler,
+        "plan_batches",
+        lambda *_args, memory_budget_bytes, **_kwargs: (
+            budgets.append(memory_budget_bytes) or []
+        ),
+    )
+
+    candidate_job = job(0, (0, 1), (0, 1))
+    work = scheduler._Work(candidate_job.files, (candidate_job,))
+    queued_work = iter((work, None))
+    messages = []
+    scheduler._gpu_worker(
+        0,
+        SimpleNamespace(get=lambda: next(queued_work)),
+        SimpleNamespace(put=messages.append),
+        None,
+        explicit_budget,
+        safety_fraction,
+        1,
+    )
+
+    if expected is None:
+        assert budgets == []
+        assert messages[0]["type"] == "error"
+        assert "no usable free memory" in messages[0]["error"]
+    else:
+        assert budgets == [expected]
+        assert messages == [{"type": "done", "device": 0}]
+    assert pool.free_calls == 1
+    assert pool.get_limit_calls == 1
+    assert pool.used_calls == bool(pool_limit)
+    assert pool.default_pool_calls == 1
 
 
 def test_run_jobs_failure_does_not_wait_for_unconsumed_queue_payload(tmp_path):

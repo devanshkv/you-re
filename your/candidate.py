@@ -461,13 +461,13 @@ class Candidate(Your):
             ft, dmt = process_cpu(self, plan, profile=profile, threads=cpu_threads)
         elif target == "GPU":
             from your.utils.candidate_pipeline import read_plan_data
+            from your.utils.candidate_scheduler import _gpu_memory_budget
             from your.utils.gpu import _cupy, estimate_process_gpu_bytes, process_gpu
             from your.utils.gpu_streaming import process_gpu_streaming
 
             cp = _cupy()
             with cp.cuda.Device(self.device):
-                free, _ = cp.cuda.runtime.memGetInfo()
-                budget = int(free * 0.8)
+                budget = _gpu_memory_budget(cp)
                 streaming = (
                     estimate_process_gpu_bytes(plan, self.your_header.dtype) > budget
                 )

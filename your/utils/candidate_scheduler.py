@@ -122,6 +122,16 @@ def choose_memory_budget(free_bytes: int, safety_fraction: float = 0.8) -> int:
     return int(int(free_bytes) * float(safety_fraction))
 
 
+def _gpu_memory_budget(cp, safety_fraction: float = 0.8) -> int:
+    free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    pool = cp.get_default_memory_pool()
+    available = choose_memory_budget(free_bytes + pool.free_bytes(), safety_fraction)
+    pool_limit = pool.get_limit()
+    if pool_limit:
+        available = min(available, pool_limit - pool.used_bytes())
+    return available
+
+
 def _job_interval(
     job: CandidateJob, start_name: str, stop_name: str
 ) -> tuple[int, int]:
@@ -646,9 +656,12 @@ def _queue_candidate_save(
         + profile.get("cache_upload_s", 0.0)
         + profile.get("runtime_oom_s", 0.0)
     )
+    output_filename = job.output_filename
+    if output_filename is None:
+        output_filename = f"{candidate.id}_{job.index}.h5"
     return {
         "future": writer.submit(
-            _save_candidate, candidate, output_dir, job.output_filename
+            _save_candidate, candidate, output_dir, output_filename
         ),
         "device": device,
         "job": job,
@@ -810,15 +823,12 @@ def _run_batch(cp, process_gpu, base, batch, resident, device, max_inflight):
         )
         if non_oom_error is not None:
             raise non_oom_error
-        error_message = str(errors[0])
         for error in errors:
             _clear_exception_tracebacks(error)
         results.clear()
         errors.clear()
         futures.clear()
         del future
-        if len(batch.jobs) == 1:
-            raise MemoryError(error_message) from None
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
         for job in batch.jobs:
@@ -881,8 +891,7 @@ def _gpu_worker(
         from your.utils.gpu import estimate_process_gpu_bytes, process_gpu
 
         with cp.cuda.Device(device):
-            free_bytes, _ = cp.cuda.runtime.memGetInfo()
-            available = choose_memory_budget(free_bytes, safety_fraction)
+            available = _gpu_memory_budget(cp, safety_fraction)
             budget = (
                 available
                 if memory_budget_bytes is None
@@ -1095,7 +1104,7 @@ def _gpu_worker(
             finally:
                 writer.shutdown(wait=True, cancel_futures=True)
         result_queue.put({"type": "done", "device": device})
-    except BaseException as exc:
+    except Exception as exc:
         result_queue.put(
             {
                 "type": "error",
@@ -1105,6 +1114,22 @@ def _gpu_worker(
                 "traceback": traceback.format_exc(),
             }
         )
+
+
+def _validated_reports(jobs, reports):
+    expected = {job.index for job in jobs}
+    missing = sorted(expected - reports.keys())
+    if missing:
+        raise RuntimeError(
+            f"GPU workers completed without reports for candidate indices {missing}"
+        )
+    unexpected = sorted(reports.keys() - expected)
+    if unexpected:
+        raise RuntimeError(
+            "GPU workers returned reports for unexpected candidate indices "
+            f"{unexpected}"
+        )
+    return [reports[index] for index in sorted(reports)]
 
 
 def _run_jobs_in_process(
@@ -1163,19 +1188,7 @@ def _run_jobs_in_process(
 
     if not completed:
         raise RuntimeError(f"GPU worker {device} exited before reporting completion")
-    expected = {job.index for job in jobs}
-    missing = sorted(expected - reports.keys())
-    if missing:
-        raise RuntimeError(
-            f"GPU workers completed without reports for candidate indices {missing}"
-        )
-    unexpected = sorted(reports.keys() - expected)
-    if unexpected:
-        raise RuntimeError(
-            f"GPU workers returned reports for unexpected candidate indices "
-            f"{unexpected}"
-        )
-    return [reports[index] for index in sorted(reports)]
+    return _validated_reports(jobs, reports)
 
 
 def run_jobs(
@@ -1329,13 +1342,9 @@ def run_jobs(
                     f"GPU worker {device} exited with status "
                     f"{state['process'].exitcode}"
                 )
-        if len(reports) != len(jobs):
-            missing = sorted({job.index for job in jobs} - reports.keys())
-            raise RuntimeError(
-                f"GPU workers completed without reports for candidate indices {missing}"
-            )
+        validated_reports = _validated_reports(jobs, reports)
         completed_successfully = True
-        return [reports[index] for index in sorted(reports)]
+        return validated_reports
     finally:
         for state in workers.values():
             process = state["process"]

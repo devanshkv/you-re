@@ -169,7 +169,7 @@ def pad_along_axis(array: np.ndarray, target_length, loc="end", axis=0, **kwargs
     elif loc == "end":
         npad[axis] = (0, int(pad_size))
     else:
-        npad[axis] = (int(pad_size // 2), int(pad_size // 2))
+        npad[axis] = (int(pad_size // 2), int(pad_size - pad_size // 2))
 
     return np.pad(array, pad_width=npad, **kwargs)
 

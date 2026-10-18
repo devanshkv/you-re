@@ -116,7 +116,7 @@ def test_streaming_preserves_large_finite_float64_structure():
         np.testing.assert_allclose(got, want, rtol=0.003, atol=0.003)
 
 
-def test_streaming_preserves_cpu_rfi_masked_array_semantics_for_zero_channels():
+def test_streaming_rfi_excludes_zero_channels_and_matches_cpu():
     data = np.random.default_rng(18).integers(90, 140, (18, 48)).astype(np.float64)
     data[:, ::3] = 0
 
@@ -135,7 +135,7 @@ def test_streaming_preserves_cpu_rfi_masked_array_semantics_for_zero_channels():
     expected = process_cpu(expected_cand, plan)
     expected_mask = expected_cand.rfi_mask.copy()
     assert np.all(expected_mask[::3])
-    assert expected_mask[10]
+    assert np.any(~expected_mask[np.arange(data.shape[1]) % 3 != 0])
 
     actual_cand = rfi_candidate()
     actual = process_gpu_streaming(actual_cand, plan, memory_budget_bytes=65536)

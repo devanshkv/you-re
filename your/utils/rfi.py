@@ -111,16 +111,18 @@ def spectral_kurtosis(data, N=1, d=None):
 
 
 def sk_rejection_mask(sk, sigma):
-    """Apply the existing SK median/MAD threshold, preserving masked inputs."""
-    if not np.any(np.isfinite(np.ma.filled(sk, np.nan))):
-        return np.ones(np.shape(sk), dtype=bool)
-    nan_mask = np.isnan(sk)
-    sk[nan_mask] = np.nan
-    sk_c = sk[~nan_mask]
+    """Apply the existing SK median/MAD threshold to valid channels."""
+    sk = np.ma.asarray(sk)
+    valid = np.isfinite(sk.data) & ~np.ma.getmaskarray(sk)
+    rejected = np.ones(sk.shape, dtype=bool)
+    if not np.any(valid):
+        return rejected
+    sk_c = sk.data[valid]
     std = 1.4826 * stats.median_abs_deviation(sk_c)
-    h = np.median(sk_c) + sigma * std
-    l = np.median(sk_c) - sigma * std
-    return ~((sk < h) & (sk > l))
+    upper = np.median(sk_c) + sigma * std
+    lower = np.median(sk_c) - sigma * std
+    rejected[valid] = ~((sk_c < upper) & (sk_c > lower))
+    return rejected
 
 
 def sk_filter(data, channel_bandwidth, tsamp, N=None, d=None, sigma=5):
